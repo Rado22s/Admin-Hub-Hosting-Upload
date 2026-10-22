@@ -1,0 +1,2 @@
+# Apache 2.4: deny direct web access to stored files and metadata.
+Require all denied

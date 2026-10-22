@@ -1,0 +1,1586 @@
+<!DOCTYPE html>
+<html lang="sk">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ADMIN HUB v6.1 — Dokumenty (náhľad a triedenie)</title>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script src="https://cdn.tailwindcss.com"></script>
+<script>tailwind.config={darkMode:'class',theme:{extend:{fontFamily:{sans:['Inter','sans-serif'],mono:['JetBrains Mono','monospace']}}}}</script>
+<script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mammoth@1.6.0/mammoth.browser.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js"></script>
+<script>if(window.pdfjsLib){ window.pdfjsLib.GlobalWorkerOptions.workerSrc="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js"; }</script>
+<style>*{font-family:Inter,sans-serif}.mono{font-family:'JetBrains Mono',monospace}.scrollbar-thin::-webkit-scrollbar{width:6px;height:6px}.scrollbar-thin::-webkit-scrollbar-thumb{background:#ccc;border-radius:10px}.dark .scrollbar-thin::-webkit-scrollbar-thumb{background:#444}</style>
+</head>
+<body class="bg-[#fafaf9] dark:bg-[#121212] text-zinc-900 dark:text-zinc-100 antialiased">
+<div id="root"></div>
+<script crossorigin src="https://unpkg.com/react@18.2.0/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7.23.9/babel.min.js"></script>
+<script type="text/babel">
+
+const USERS = [
+  {id:"konyk", name:"Cato", initials:"C", color:"#ff5a1f", role:"Lead"},
+  {id:"tajfun", name:"Martin Fojtu", initials:"M", color:"#6b7cff", role:"Lead"},
+  {id:"rado", name:"Radoslav", initials:"R", color:"#00c950", role:"Lead"},
+];
+
+// Oprava: Striktné lokálne parsovanie dátumov bez UTC posunu (new Date("YYYY-MM-DD") parsuje ako UTC!)
+function parseLocalYMD(dateStr){
+  if(!dateStr || typeof dateStr !== 'string') return new Date();
+  const parts = dateStr.split('-').map(Number);
+  if(parts.length !== 3 || parts.some(isNaN)) return new Date();
+  return new Date(parts[0], parts[1]-1, parts[2], 12, 0, 0);
+}
+function formatLocalDate(d){
+  const y=d.getFullYear();
+  const m=String(d.getMonth()+1).padStart(2,'0');
+  const day=String(d.getDate()).padStart(2,'0');
+  return `${y}-${m}-${day}`;
+}
+function getLocalToday(){
+  return formatLocalDate(new Date());
+}
+function daysAgoLocal(n){
+  const d=new Date();
+  d.setDate(d.getDate()-n);
+  return formatLocalDate(d);
+}
+function getWeekRangeLocal(dateStr){
+  const d=parseLocalYMD(dateStr);
+  const day=d.getDay();
+  const diffToMon = day===0 ? -6 : 1-day;
+  const mon=new Date(d.getFullYear(), d.getMonth(), d.getDate()+diffToMon, 12, 0, 0);
+  const sun=new Date(mon.getFullYear(), mon.getMonth(), mon.getDate()+6, 12, 0, 0);
+  return {from: formatLocalDate(mon), to: formatLocalDate(sun)};
+}
+function getMonthRangeLocal(dateStr){
+  const d=parseLocalYMD(dateStr);
+  const first=new Date(d.getFullYear(), d.getMonth(), 1, 12, 0, 0);
+  const last=new Date(d.getFullYear(), d.getMonth()+1, 0, 12, 0, 0);
+  return {from: formatLocalDate(first), to: formatLocalDate(last)};
+}
+const TODAY = getLocalToday();
+
+// Pomocne funkcie pre dokumenty: zobrazenie autora, casu nahratia a textovej ukazky.
+function documentUserName(userId){
+  const user = USERS.find(u => u.id === userId);
+  return user ? user.name : (userId || 'Neznámy používateľ');
+}
+function documentDateValue(doc){
+  const raw = doc?.uploadedAt || doc?.updatedAt || doc?.createdAt || doc?.date;
+  if(!raw) return 0;
+  const normalized = /^\d{4}-\d{2}-\d{2}$/.test(String(raw)) ? `${raw}T12:00:00` : raw;
+  const n = new Date(normalized).getTime();
+  return Number.isFinite(n) ? n : 0;
+}
+function documentDateLabel(doc){
+  const stamp = documentDateValue(doc);
+  if(!stamp) return doc?.date || 'Neznámy dátum';
+  return new Date(stamp).toLocaleString('sk-SK', {year:'numeric', month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit'});
+}
+function documentTextSnippet(doc, maxLen=700){
+  let text = String(doc?.extractedText || '').trim();
+  if(!text && doc?.currentContent && ['txt','md','csv','html'].includes(doc.type)){
+    try{
+      const raw = base64ToUtf8(dataURLtoBase64(doc.currentContent));
+      if(doc.type === 'html'){
+        const parsed = new DOMParser().parseFromString(sanitizeHtml(raw), 'text/html');
+        text = parsed.body?.textContent || '';
+      } else text = raw;
+    }catch(e){}
+  }
+  text = text.replace(/\s+/g, ' ').trim();
+  if(!text) return '';
+  return text.length > maxLen ? text.slice(0, maxLen).trimEnd() + '…' : text;
+}
+
+// Oprava: Kompletná a konzistentná matica oprávnení (Lead má explicitne všetky práva)
+const ROLE_PERMS = {
+  Lead: ['create_topic','edit_topic','delete_topic','create_blog','edit_blog','delete_blog','create_post','edit_post','delete_post','upload_doc','delete_doc','delete_own_doc','pin_post','manage_checklist','manage_own_checklist','edit_tags','edit_own_tags','restore_version','restore_own_version','chat','view'],
+  Editor: ['create_topic','edit_topic','create_blog','edit_blog','create_post','edit_post','upload_doc','delete_own_doc','pin_post','manage_checklist','edit_tags','restore_version','chat','view'],
+  Content: ['create_post','edit_own_post','delete_own_post','manage_own_checklist','upload_doc','delete_own_doc','edit_own_tags','restore_own_version','chat','view']
+};
+
+function can(role, action, ownerId=null, currentUserId=null){
+  const perms = ROLE_PERMS[role]||[];
+  if(perms.includes(action)) return true;
+  if(!ownerId || !currentUserId || ownerId !== currentUserId) return false;
+  const ownMap = {
+    delete_doc: 'delete_own_doc',
+    edit_tags: 'edit_own_tags',
+    restore_version: 'restore_own_version',
+    edit_post: 'edit_own_post',
+    delete_post: 'delete_own_post',
+    manage_checklist: 'manage_own_checklist'
+  };
+  return ownMap[action] ? perms.includes(ownMap[action]) : false;
+}
+
+async function hashPassword(pw){
+  const enc=new TextEncoder().encode(pw);
+  const buf=await crypto.subtle.digest('SHA-256', enc);
+  return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,'0')).join('');
+}
+const hexOf=b=>Array.from(new Uint8Array(b)).map(x=>x.toString(16).padStart(2,'0')).join('');
+async function pbkdf2(pw,saltHex){
+  const salt=new Uint8Array(saltHex.match(/../g).map(h=>parseInt(h,16)));
+  const k=await crypto.subtle.importKey('raw',new TextEncoder().encode(pw),'PBKDF2',false,['deriveBits']);
+  return hexOf(await crypto.subtle.deriveBits({name:'PBKDF2',salt,iterations:150000,hash:'SHA-256'},k,256));
+}
+async function makeCred(pw){ const s=hexOf(crypto.getRandomValues(new Uint8Array(16))); return {algo:'pbkdf2',salt:s,hash:await pbkdf2(pw,s),lastChanged:new Date().toISOString()}; }
+async function verifyCred(pw,c){ if(!c||!c.hash||!c.salt) return false; return (await pbkdf2(pw,c.salt))===c.hash; }
+async function verifyLegacySha256(pw,c){ if(!c||!c.hash) return false; if(c.salt) return false; return (await hashPassword(pw))===c.hash; }
+
+function base64ToUtf8(base64){
+  try{
+    const binary=atob(base64);
+    const bytes=Uint8Array.from(binary, c=>c.charCodeAt(0));
+    return new TextDecoder().decode(bytes);
+  }catch(e){
+    try{ return decodeURIComponent(escape(atob(base64))); }catch(e2){ return ''; }
+  }
+}
+function dataURLtoBase64(dataURL){ return (dataURL||'').split(',')[1]||''; }
+function dataURLtoBytes(dataURL){
+  try{
+    const base64=dataURLtoBase64(dataURL);
+    const binary=atob(base64);
+    const bytes=new Uint8Array(binary.length);
+    for(let i=0;i<binary.length;i++) bytes[i]=binary.charCodeAt(i);
+    return bytes;
+  }catch(e){ return new Uint8Array(); }
+}
+
+// Extrakcia textu pre fulltext (TXT, CSV, HTML, XLSX, DOCX, PDF) — asynchrónne, neblokuje UI (yield via await)
+async function extractSearchableText(type, dataUrl){
+  if(!dataUrl) return '';
+  try{
+    if(['txt','csv','html'].includes(type)){
+      const raw = base64ToUtf8(dataURLtoBase64(dataUrl));
+      if(type==='html'){
+        const tmp = document.createElement('div');
+        tmp.innerHTML = sanitizeHtml(raw);
+        return (tmp.textContent || tmp.innerText || '').slice(0, 50000);
+      }
+      return raw.slice(0, 50000);
+    }
+    if(type==='xlsx' && window.XLSX){
+      const bytes = dataURLtoBytes(dataUrl);
+      const wb = XLSX.read(bytes, {type:'array'});
+      return wb.SheetNames.map(name => XLSX.utils.sheet_to_csv(wb.Sheets[name])).join('\n').slice(0, 50000);
+    }
+    if(type==='docx' && window.mammoth){
+      const bytes = dataURLtoBytes(dataUrl);
+      const res = await mammoth.extractRawText({arrayBuffer: bytes.buffer});
+      return (res.value || '').slice(0, 50000);
+    }
+    if(type==='pdf' && window.pdfjsLib){
+      try{
+        const bytes = dataURLtoBytes(dataUrl);
+        const pdf = await window.pdfjsLib.getDocument({data: bytes}).promise;
+        let text = '';
+        for(let i=1;i<=Math.min(pdf.numPages, 10);i++){
+          const page = await pdf.getPage(i);
+          const tc = await page.getTextContent();
+          text += tc.items.map(it=>it.str).join(' ') + '\n';
+          if(text.length>50000) break;
+          // yield to UI
+          await new Promise(r=>setTimeout(r,0));
+        }
+        return text.slice(0,50000);
+      }catch(e){}
+    }
+  }catch(e){}
+  return '';
+}
+
+// Reálna implementácia IndexedDB pre binárne obsahy dokumentov (odstraňuje 4.5 MB limit localStorage)
+const IDB_NAME = 'admin_hub_idb_v6';
+const IDB_STORE = 'doc_blobs';
+function openIDB(){
+  return new Promise((resolve, reject)=>{
+    if(!window.indexedDB) return reject(new Error('IndexedDB nepodporované'));
+    const req = indexedDB.open(IDB_NAME, 1);
+    req.onupgradeneeded = (e)=>{
+      const db = e.target.result;
+      if(!db.objectStoreNames.contains(IDB_STORE)) db.createObjectStore(IDB_STORE);
+    };
+    req.onsuccess = ()=>resolve(req.result);
+    req.onerror = ()=>reject(req.error);
+  });
+}
+async function idbPut(key, val){
+  const db = await openIDB();
+  return new Promise((resolve, reject)=>{
+    const tx = db.transaction(IDB_STORE, 'readwrite');
+    tx.objectStore(IDB_STORE).put(val, key);
+    tx.oncomplete = ()=>{ db.close(); resolve(true); };
+    tx.onerror = ()=>{ db.close(); reject(tx.error); };
+  });
+}
+async function idbGet(key){
+  const db = await openIDB();
+  return new Promise((resolve, reject)=>{
+    const tx = db.transaction(IDB_STORE, 'readonly');
+    const req = tx.objectStore(IDB_STORE).get(key);
+    req.onsuccess = ()=>{ db.close(); resolve(req.result ?? null); };
+    req.onerror = ()=>{ db.close(); reject(req.error); };
+  });
+}
+async function idbDel(key){
+  const db = await openIDB();
+  return new Promise((resolve, reject)=>{
+    const tx = db.transaction(IDB_STORE, 'readwrite');
+    tx.objectStore(IDB_STORE).delete(key);
+    tx.oncomplete = ()=>{ db.close(); resolve(true); };
+    tx.onerror = ()=>{ db.close(); reject(tx.error); };
+  });
+}
+async function idbClear(){
+  const db = await openIDB();
+  return new Promise((resolve, reject)=>{
+    const tx = db.transaction(IDB_STORE, 'readwrite');
+    tx.objectStore(IDB_STORE).clear();
+    tx.oncomplete = ()=>{ db.close(); resolve(true); };
+    tx.onerror = ()=>{ db.close(); reject(tx.error); };
+  });
+}
+
+const STORAGE_LIMIT = 4.5*1024*1024;
+const LOCAL_FALLBACK_LIMIT = 3.3*1024*1024; // reálny limit pre inline base64 v localStorage (bloat ~33%)
+const MAX_FILE = 15*1024*1024; // Vďaka IndexedDB 15 MB/súbor, fallback do localStorage má limit 3.3 MB (base64 bloat) a kontroluje sa cez LOCAL_FALLBACK_LIMIT
+const MAX_BLOG_HISTORY = 20;
+const MAX_CHAT_MESSAGES = 200;
+const MAX_DOC_VERSIONS = 10;
+const HTML_PREVIEW_SANDBOX = '';
+
+// Server-side shared document storage (PHP endpoint in ./api/documents.php).
+// The access token is entered by a site administrator/user and kept in sessionStorage only.
+const HOSTING_API_URL = new URL('./api/documents.php', window.location.href).toString();
+const HOSTING_TOKEN_KEY = 'admin_hub_hosting_api_token_v1';
+function getHostingToken(){ try{return sessionStorage.getItem(HOSTING_TOKEN_KEY)||'';}catch(e){return '';} }
+async function hostingRequest(query='', init={}){
+  let token=getHostingToken();
+  if(!token){
+    token=prompt('Zadaj tímové heslo pre privátne úložisko dokumentov na hostingu. Heslo nastav v api/config.php.');
+    if(!token) throw new Error('Pripojenie k hostingu bolo zrušené.');
+    try{sessionStorage.setItem(HOSTING_TOKEN_KEY,token);}catch(e){}
+  }
+  const headers=new Headers(init.headers||{});
+  headers.set('X-Admin-Hub-Token',token);
+  const response=await fetch(HOSTING_API_URL+query,{...init,headers,cache:'no-store',credentials:'same-origin'});
+  if(response.status===401 || response.status===403){
+    try{sessionStorage.removeItem(HOSTING_TOKEN_KEY);}catch(e){}
+    throw new Error('Hosting odmietol heslo úložiska. Skontroluj hodnotu v api/config.php.');
+  }
+  if(!response.ok){
+    let detail='HTTP '+response.status;
+    try{const j=await response.clone().json(); if(j.error) detail=j.error;}catch(e){}
+    throw new Error(detail);
+  }
+  return response;
+}
+function fromHostingDocument(r){
+  const stamp=r.uploadedAt||r.updatedAt||r.createdAt||new Date().toISOString();
+  return {
+    id:'hosting-'+r.id, remoteId:r.id, hostingStorage:true, name:r.name,
+    type:r.type||getFileType(r.name), size:r.size||formatSize(Number(r.sizeBytes||0)), sizeBytes:Number(r.sizeBytes||0),
+    authorId:r.authorId||'unknown', createdBy:r.createdBy||r.authorId||'unknown',
+    date:(stamp||'').slice(0,10)||getLocalToday(), createdAt:r.createdAt||stamp,
+    uploadedAt:stamp, updatedAt:r.updatedAt||stamp, tags:Array.isArray(r.tags)?r.tags:[],
+    versions:Array.isArray(r.versions)?r.versions:[], extractedText:String(r.extractedText||'').slice(0,3000),
+    currentContent:'', hasIdbBlob:false, isDemo:false
+  };
+}
+async function blobAsDataURL(blob){
+  return await new Promise((resolve,reject)=>{const r=new FileReader();r.onload=()=>resolve(r.result);r.onerror=()=>reject(r.error||new Error('Nepodarilo sa načítať súbor'));r.readAsDataURL(blob);});
+}
+
+
+// Striktná sanitizácia HTML + validácia a escapovanie URL (prevencia XSS v blogoch a DOCX)
+function sanitizeHtml(h){
+  if(!window.DOMPurify) return '<p>Sanitizér sa nenačítal — obsah nezobrazený.</p>';
+  return window.DOMPurify.sanitize(String(h||''), {
+    USE_PROFILES: {html: true},
+    FORBID_TAGS: ['script','style','iframe','object','embed','form','input','button'],
+    FORBID_ATTR: ['onerror','onload','onclick','onmouseover','onfocus','onblur']
+  });
+}
+function sanitizeUrl(rawUrl){
+  if(!rawUrl) return null;
+  try{
+    const u = new URL(rawUrl.trim());
+    if(u.protocol !== 'http:' && u.protocol !== 'https:') return null;
+    return u.href.replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }catch(e){ return null; }
+}
+
+function normalizeLoaded(key, parsed){
+  if(!Array.isArray(parsed)) return parsed;
+  if(key.includes('docs')) return parsed.map((raw)=>{
+    const {content: legacyContent, ...d} = raw;
+    return {
+      ...d,
+      currentContent: d.hasIdbBlob ? '' : (d.currentContent ?? legacyContent ?? ''),
+      extractedText: d.extractedText ?? '',
+      tags: Array.isArray(d.tags) ? d.tags : [],
+      isDemo: d.isDemo ?? false,
+      versions: Array.isArray(d.versions) ? d.versions.slice(-MAX_DOC_VERSIONS).map((vv)=>{
+        const {content: legacyV, ...v} = vv;
+        return {
+          ...v,
+          currentContent: v.hasIdbBlob ? '' : (v.currentContent ?? legacyV ?? '')
+        };
+      }) : []
+    };
+  });
+  if(key.includes('blogs')) return parsed.map(({currentContent, ...it})=>({
+    ...it,
+    content: sanitizeHtml(it.content ?? currentContent ?? ''),
+    seoTags: Array.isArray(it.seoTags) ? it.seoTags : [],
+    history: Array.isArray(it.history) ? it.history.slice(-MAX_BLOG_HISTORY) : []
+  }));
+  if(key.includes('posts')) return parsed.map(({currentContent, ...it})=>({
+    ...it,
+    content: it.content ?? currentContent ?? '',
+    checklist: Array.isArray(it.checklist) ? it.checklist : []
+  }));
+  if(key.includes('chat')) return parsed.slice(-MAX_CHAT_MESSAGES);
+  return parsed;
+}
+function serializeForStorage(key, state){
+  if(key.includes('docs') && Array.isArray(state)){
+    // V5: konzistentné — ak hasIdbBlob, neukladaj base64 do localStorage (IDB je zdroj pravdy)
+    return state.map((doc)=>{
+      const {content: legacyContent, ...d} = doc;
+      return {
+        ...d,
+        currentContent: d.hasIdbBlob ? '' : (d.currentContent||''),
+        versions: (d.versions||[]).slice(-MAX_DOC_VERSIONS).map((v)=>{
+          const {content: legacyV, ...vv} = v;
+          return {
+            ...vv,
+            currentContent: vv.hasIdbBlob ? '' : (vv.currentContent||'')
+          };
+        })
+      };
+    });
+  }
+  return state;
+}
+function isSessionValid(userId, expiry, now=Date.now()){ return !!userId && !!expiry && new Date(expiry).getTime() > now; }
+function exceedsQuota(docs){ 
+  const serialized = JSON.stringify(serializeForStorage('docs',docs));
+  // Ak má dokument hasIdbBlob=false a currentContent je veľký base64, kontroluj aj LOCAL_FALLBACK_LIMIT
+  const hasLargeInline = docs.some(d=>!d.hasIdbBlob && (d.currentContent||'').length > LOCAL_FALLBACK_LIMIT);
+  return serialized.length > STORAGE_LIMIT || hasLargeInline;
+}
+function nextVersionNo(doc){ return Math.max(0,...(doc.versions||[]).map(v=>v.version||0))+1; }
+
+function applyUpload(docs, file, content, userId, today, extractedText='', hasIdbBlob=false){
+  const size=formatSize(file.size); const i=docs.findIndex(d=>d.name===file.name);
+  const stamp = new Date().toISOString();
+  if(i===-1){
+    const id = 'd'+Date.now()+Math.random().toString(36).slice(2,5);
+    return [...docs,{id,name:file.name,type:getFileType(file.name),size,authorId:userId,createdBy:userId,date:today,createdAt:stamp,uploadedAt:stamp,updatedAt:stamp,tags:[],versions:[],currentContent:content,extractedText,hasIdbBlob,isDemo:false}];
+  }
+  const e=docs[i]; const c=[...docs];
+  const verNo = nextVersionNo(e);
+  const newVer = {version:verNo,currentContent:e.currentContent,hasIdbBlob:!!e.hasIdbBlob,date:e.date,createdAt:e.updatedAt||e.uploadedAt||e.createdAt||null,uploadedAt:e.uploadedAt||e.updatedAt||e.createdAt||null,authorId:e.authorId,size:e.size};
+  const trimmedVers = [...(e.versions||[]), newVer].slice(-MAX_DOC_VERSIONS);
+  c[i]={...e,currentContent:content,extractedText,hasIdbBlob,date:today,uploadedAt:stamp,updatedAt:stamp,size,authorId:userId,createdBy:e.createdBy||e.authorId||userId,createdAt:e.createdAt||stamp,isDemo:false,versions:trimmedVers};
+  return c;
+}
+function restoreVersionPure(doc, idx, userId, today){
+  const ver=doc.versions?.[idx]; if(!ver||(!ver.currentContent && !ver.hasIdbBlob)) return null;
+  const verNo = nextVersionNo(doc);
+  const stamp = new Date().toISOString();
+  const snapshotOld = {version:verNo,currentContent:doc.currentContent,hasIdbBlob:!!doc.hasIdbBlob,date:doc.date,createdAt:doc.updatedAt||doc.uploadedAt||doc.createdAt||null,uploadedAt:doc.uploadedAt||doc.updatedAt||doc.createdAt||null,authorId:doc.authorId,size:doc.size};
+  return {...doc, currentContent:ver.currentContent, hasIdbBlob:!!ver.hasIdbBlob, size:ver.size, date:today, uploadedAt:stamp, updatedAt:stamp, authorId:userId,
+    versions:[...doc.versions, snapshotOld].slice(-MAX_DOC_VERSIONS)};
+}
+function makeBlogSnapshot(b){ return {prevContent:sanitizeHtml(b.content), prevTitle:b.title, prevStatus:b.status, prevExcerpt:b.excerpt, prevSeoTags:b.seoTags||[], prevCategoryId:b.categoryId}; }
+
+// Hook s automatickou migráciou v2 -> v3 -> v4 + Cross-Tab synchronizáciou (window 'storage' event)
+function usePersistentState(key, initial, opts){
+  const optsRef = React.useRef(opts); optsRef.current = opts;
+  const lastSaved = React.useRef(null);
+  const rolling = React.useRef(false);
+  const [state, setState] = React.useState(()=>{
+    const candidates = [key, key.replace('_v6','_v5'), key.replace('_v6','_v4'), key.replace('_v6','_v3'), key.replace('_v6','_v2')];
+    for(const k of candidates){
+      try{
+        const raw=localStorage.getItem(k);
+        if(raw){
+          const v=normalizeLoaded(key, JSON.parse(raw));
+          lastSaved.current=v;
+          return v;
+        }
+      }catch(e){}
+    }
+    lastSaved.current=initial; return initial;
+  });
+  const [error, setError] = React.useState(null);
+
+  React.useEffect(()=>{
+    try{
+      const str = JSON.stringify(serializeForStorage(key, state));
+      if(str.length > STORAGE_LIMIT) throw new Error(`Dáta v localStorage sú príliš veľké (${(str.length/1024/1024).toFixed(2)} MB, limit ${(STORAGE_LIMIT/1024/1024).toFixed(1)} MB)`);
+      localStorage.setItem(key, str);
+      lastSaved.current = state;
+      if(rolling.current) rolling.current=false; else setError(null);
+      optsRef.current?.onSaved?.();
+    }catch(e){
+      rolling.current = true;
+      setError(e.message);
+      optsRef.current?.onFail?.(e.message);
+      setState(lastSaved.current);
+    }
+  }, [key, state]);
+
+  // Synchronizácia medzi tabmi: Storage event (metadáta) + BroadcastChannel (notifikácia o IDB blobe)
+  React.useEffect(()=>{
+    let bc = null;
+    try{
+      if(window.BroadcastChannel){
+        bc = new BroadcastChannel('admin_hub_sync_v6');
+        bc.onmessage = (ev)=>{
+          if(ev.data && ev.data.key === key){
+            try{
+              // metadáta už v localStorage, IDB je zdieľaná (rovnaký origin) — stačí reload metadát
+              const raw = localStorage.getItem(key);
+              if(raw){
+                const parsed = normalizeLoaded(key, JSON.parse(raw));
+                lastSaved.current = parsed;
+                setState(parsed);
+              }
+            }catch(err){}
+          }
+        };
+      }
+    }catch(e){}
+    const onStorage = (e)=>{
+      if(e.key === key && e.newValue){
+        try{
+          const parsed = normalizeLoaded(key, JSON.parse(e.newValue));
+          lastSaved.current = parsed;
+          setState(parsed);
+        }catch(err){}
+      }
+    };
+    window.addEventListener('storage', onStorage);
+    return ()=>{
+      window.removeEventListener('storage', onStorage);
+      if(bc) try{ bc.close(); }catch(e){}
+    };
+  }, [key]);
+
+  // Notifikácia ostatným tabom po úspešnom zápise
+  React.useEffect(()=>{
+    try{
+      if(window.BroadcastChannel){
+        const bc = new BroadcastChannel('admin_hub_sync_v6');
+        bc.postMessage({key, t: Date.now()});
+        bc.close();
+      }
+    }catch(e){}
+  }, [state]);
+
+  return [state, setState, error];
+}
+
+async function runAuditTests({auth, docsError}={}){
+  const T=[]; const add=(name,ok,detail,status)=>T.push({name,status:status||(ok?'PASS':'FAIL'),detail});
+  const t=async(name,fn)=>{ try{ const r=await fn(); add(name,r.ok,r.detail); }catch(e){ add(name,false,'Výnimka: '+e.message); } };
+  const rt=(key,arr)=>normalizeLoaded(key, JSON.parse(JSON.stringify(serializeForStorage(key,arr))));
+  const c=(r,a,o,u)=>can(r,a,o,u);
+
+  await t('localStorage zápis/čítanie (200 KB)',()=>{ const k='__audit_'+Date.now(), v='x'.repeat(200000); localStorage.setItem(k,v); const ok=localStorage.getItem(k)===v; localStorage.removeItem(k); return {ok,detail:ok?'zapísané aj prečítané rovnaké':'nezhoduje sa'}; });
+  await t('IndexedDB reálne úložisko binárok (zápis/čítanie/mazanie)',async()=>{ const k='__audit_idb_'+Date.now(); await idbPut(k,'data:text/plain;base64,dGVzdA=='); const val=await idbGet(k); await idbDel(k); const after=await idbGet(k); const ok=val==='data:text/plain;base64,dGVzdA==' && after===null; return {ok,detail:ok?'IndexedDB objektový sklad doc_blobs plne funkčný':'IndexedDB zlyhalo'}; });
+  await t('Reload & Sanitizácia: blogy sanitizujú XSS, dokumenty držia štruktúru',()=>{ const b=rt('x_blogs',[{id:'b',content:'<p>ok</p><img src=x onerror=alert(1)>'}])[0], p=rt('x_posts',[{id:'p',content:'ahoj'}])[0], d=rt('x_docs',[{id:'d',name:'a.txt',currentContent:'data:x',versions:[{version:1,content:'old'}]}])[0]; const ok=b.content==='<p>ok</p><img src="x">'&&p.content==='ahoj'&&d.currentContent==='data:x'&&d.versions[0].currentContent==='old'; return {ok,detail:`blog sanitizovaný="${b.content}", verzia="${d.versions[0].currentContent}"`}; });
+  await t('Ochrana URL v editore blogov proti atribútovému XSS',()=>{ const bad=sanitizeUrl('http://" onmouseover="alert(1)'), js=sanitizeUrl('javascript:alert(1)'), good=sanitizeUrl('https://seoflash.sk/test?a=1'); const ok=(bad===null || !bad.includes('"')) && js===null && good==='https://seoflash.sk/test?a=1'; return {ok,detail:`bad=${bad}, js=${js}, good=${good}`}; });
+  await t('Kvóta: IDB neobmedzuje localStorage, fallback 3.3MB kontrolovaný',()=>{ 
+    // Reálna V5 cesta: hasIdbBlob=true → currentContent='' → neprekročí STORAGE_LIMIT
+    const mk=n=>({name:n,size:1e6}); 
+    let d=applyUpload([],mk('a.pdf'),'', 'rado','2026-01-01','text a',true); 
+    const firstIdb=!exceedsQuota(d); 
+    // Fallback cesta: hasIdbBlob=false s veľkým base64 → prekročí LOCAL_FALLBACK_LIMIT
+    let d2=applyUpload([],mk('a.pdf'),'x'.repeat(2.4e6),'rado','2026-01-01','',false); 
+    const firstInline=!exceedsQuota(d2) && d2[0].currentContent.length < LOCAL_FALLBACK_LIMIT*1.4;
+    d2=applyUpload(d2,mk('b.pdf'),'x'.repeat(2.4e6),'rado','2026-01-01','',false); 
+    const secondExceeds=exceedsQuota(d2);
+    return {ok:firstIdb && secondExceeds,detail:`IDB cesta ok=${firstIdb} (neukladá base64 do LS), inline 1. ok=${firstInline}, po 2. presahuje=${secondExceeds} → fallback 3.3MB funguje`}; 
+  });
+  await t('Obnova verzie dokumentu + limit histórie verzií',()=>{ const doc={id:'d',authorId:'k',currentContent:'NEW',size:'2 KB',date:'d2',versions:[{version:1,currentContent:'OLD',size:'1 KB',date:'d1'}]}; const r=restoreVersionPure(doc,0,'rado','d3'); const v2=restoreVersionPure({versions:[{version:1}],currentContent:'NEW'},0,'r','d'); const ok=r&&r.currentContent==='OLD'&&r.size==='1 KB'&&r.versions.length===2&&r.versions[1].currentContent==='NEW'&&v2===null; return {ok,detail:'obnova vráti OLD+veľkosť; prázdna verzia sa odmietne'}; });
+  await t('Role: konzistentná matica oprávnení (Lead/Editor/Content)',()=>{ const ok=ROLE_PERMS.Lead.includes('edit_tags')&&ROLE_PERMS.Lead.includes('restore_version')&&!c('Content','edit_blog')&&c('Editor','edit_blog')&&!c('Content','edit_tags','konyk','rado')&&c('Content','edit_tags','rado','rado')&&!c('Content','delete_doc','konyk','rado')&&c('Content','delete_doc','rado','rado')&&!c('Editor','delete_topic')&&c('Lead','delete_topic'); return {ok,detail:'Matica ROLE_PERMS je kompletná, Content maže/edituje len vlastné, Editor nemaže témy, Lead všetko'}; });
+  await t('Relácia: expirovaná alebo bez expirácie je neplatná',()=>{ const n=Date.now(); const ok=!isSessionValid('rado',null,n)&&!isSessionValid('rado',new Date(n-1000).toISOString(),n)&&isSessionValid('rado',new Date(n+60000).toISOString(),n)&&!isSessionValid(null,new Date(n+60000).toISOString(),n); return {ok,detail:'isSessionValid kontrolovaná pri štarte aj v 60s intervale'}; });
+  await t('Dátumy: striktne lokálne parsovanie YMD (bez UTC posunu)',()=>{ const m=getMonthRangeLocal('2026-10-21'), w=getWeekRangeLocal('2026-10-21'), parsed=parseLocalYMD('2026-10-21'); const ok=m.from==='2026-10-01'&&m.to==='2026-10-31'&&w.from==='2026-10-19'&&w.to==='2026-10-25'&&parsed.getFullYear()===2026&&parsed.getMonth()===9&&parsed.getDate()===21; return {ok,detail:`mesiac ${m.from}…${m.to}, týždeň ${w.from}…${w.to}`}; });
+  await t('CSV: ; úvodzovky BOM tabulátor',()=>{ const a=parseCSVRobust('\uFEFFa;b\n"1,5";"x;y"'), b=parseCSVRobust('a\tb\n1\t2'); const ok=a.delimiter===';'&&a.rows[0][0]==='a'&&a.rows[1][0]==='1,5'&&a.rows[1][1]==='x;y'&&b.delimiter==='\t'&&b.rows[1][1]==='2'; return {ok,detail:JSON.stringify(a.rows)}; });
+  await t('UTF-8 diakritika + extrakcia textu pre fulltext',async()=>{ const o='čšžľťô Ďuga'; const b64=btoa(unescape(encodeURIComponent(o))); const d=base64ToUtf8(b64); const ext=await extractSearchableText('txt','data:text/plain;base64,'+b64); return {ok:d===o && ext===o,detail:ext}; });
+  await t('Heslá: soľ + PBKDF2 (150 000 iterácií), správne/nesprávne heslo',async()=>{ const cr=await makeCred('Heslo1234'); const ok=cr.salt.length===32&&cr.hash.length===64&&(await verifyCred('Heslo1234',cr))&&!(await verifyCred('heslo1234',cr)); return {ok,detail:`algo=${cr.algo}, soľ ${cr.salt.length} znakov`}; });
+
+  add('Serverový backend chýba (dáta lokálne, sync len medzi kartami)',false,'Táto verzia stále nemá serverový backend. Údaje zostávajú lokálne, synchronizácia funguje nanajvýš medzi kartami toho istého prehliadača a prihlasovanie ani oprávnenia nie sú vynútiteľné na serveri.','ARCHITEKTÚRA');
+  add('Publikovanie blogov nezverejňuje na internete',false,'Zmena stavu blogu na „publikovaný“ mení len lokálny záznam v localStorage. Nezverejní článok na internete — vyžaduje server + verejný frontend.','ARCHITEKTÚRA');
+  add('Produkčné testovanie v prehliadači nebolo vykonané',false,'Overenie: zdrojový kód prešiel syntaktickou kontrolou a izolované testy pomocných funkcií prešli. Kompletné testovanie v skutočnom prehliadači (E2E) som nevykonal, preto výsledok nemožno označiť za produkčne otestovaný.','NEOVERENÉ');
+  return T;
+}
+
+function getFileType(name){
+  const ext=name.split('.').pop().toLowerCase();
+  if(['pdf'].includes(ext)) return 'pdf';
+  if(['jpg','jpeg','png','webp','gif','svg'].includes(ext)) return 'image';
+  if(['xlsx','xls'].includes(ext)) return 'xlsx';
+  if(['csv'].includes(ext)) return 'csv';
+  if(['mp4','mov','webm','avi'].includes(ext)) return 'video';
+  if(['docx','doc'].includes(ext)) return 'docx';
+  if(['txt','md'].includes(ext)) return 'txt';
+  if(['html','htm'].includes(ext)) return 'html';
+  return 'file';
+}
+function formatSize(bytes){ if(bytes<1024) return bytes+' B'; if(bytes<1024*1024) return (bytes/1024).toFixed(1)+' KB'; return (bytes/1024/1024).toFixed(1)+' MB'; }
+function timeAgo(iso){ const diff=Date.now()-new Date(iso).getTime(); const m=Math.floor(diff/60000); if(m<1) return 'teraz'; if(m<60) return `pred ${m} min`; const h=Math.floor(m/60); if(h<24) return `pred ${h} h`; return `pred ${Math.floor(h/24)} d`; }
+
+function parseCSVRobust(text){
+  text = String(text || '').replace(/^\uFEFF/, '');
+  const firstLine = (text.split(/\r?\n/)[0] || '').replace(/"(?:[^"]|"")*"/g, '');
+  const count = c => firstLine.split(c).length - 1;
+  const delimiter = [';', '\t', ','].reduce((best, c) => count(c) > count(best) ? c : best, ',');
+  const rows = [];
+  let row = [], cell = '', inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i], next = text[i + 1];
+    if (ch === '"') {
+      if (inQuotes && next === '"') { cell += '"'; i++; }
+      else { inQuotes = !inQuotes; }
+    } else if (ch === delimiter && !inQuotes) {
+      row.push(cell); cell = '';
+    } else if ((ch === '\r' || ch === '\n') && !inQuotes) {
+      if (ch === '\r' && next === '\n') i++;
+      if (cell !== '' || row.length > 0) { row.push(cell); rows.push(row); row = []; cell = ''; }
+    } else {
+      cell += ch;
+    }
+  }
+  if (cell !== '' || row.length > 0) { row.push(cell); rows.push(row); }
+  return {delimiter, rows};
+}
+
+const ALLOWED_EXTS = ['pdf','jpg','jpeg','png','webp','gif','svg','xlsx','xls','csv','mp4','mov','webm','avi','docx','doc','txt','md','html','htm'];
+
+const INITIAL_TOPICS = [
+  {id:"t1", name:"Produkt", desc:"Vývoj a roadmap", color:"#ff5a1f", icon:"◍", isDemo:true},
+  {id:"t2", name:"Marketing", desc:"Kampane a obsah", color:"#6b7cff", icon:"◐", isDemo:true},
+  {id:"t3", name:"Design", desc:"UI/UX a systémy", color:"#00c950", icon:"◑", isDemo:true},
+];
+
+const INITIAL_DOCS = [
+  {id:"d1", name:"brand-manual-2026.pdf", type:"pdf", size:"4.2 MB", authorId:"rado", date:daysAgoLocal(1), tags:["brand"], versions:[], currentContent:"", extractedText:"Brand manuál 2026 vizuálna identita logotyp", isDemo:true},
+  {id:"d2", name:"ukazka-poznamky.txt", type:"txt", size:"0.2 KB", authorId:"konyk", date:daysAgoLocal(2), tags:["ukazka"], versions:[], currentContent:"data:text/plain;base64,"+btoa(unescape(encodeURIComponent("Ukážka s diakritikou: čšžľťô\nToto je reálny obsah, nie externý link."))), extractedText:"Ukážka s diakritikou: čšžľťô Toto je reálny obsah, nie externý link.", isDemo:true},
+  {id:"d3", name:"Q3-report.csv", type:"csv", size:"0.1 KB", authorId:"tajfun", date:daysAgoLocal(3), tags:["report"], versions:[], currentContent:"data:text/csv;base64,"+btoa(unescape(encodeURIComponent('Mesiac;Tržby;Náklady\nJanuár;12000;8000\nFebruár;"15,000";9000'))), extractedText:"Mesiac;Tržby;Náklady Január;12000;8000 Február;15,000;9000", isDemo:true},
+];
+
+const INITIAL_BLOGS = [
+  {id:"b1", title:"Ako sme navrhli ADMIN HUB", excerpt:"Minimalistický prístup a bezpečná sanitizácia.", content:"<h2>Architektúra v4</h2><p>Obsah článku je teraz plne sanitizovaný cez <strong>DOMPurify</strong> a dá sa priamo čítať v čitateľskom náhľade.</p>", categoryId:"t3", authorId:"rado", status:"publikovaný", seoTags:["admin","architektura"], date:daysAgoLocal(1), readTime:"5 min", history:[{date:daysAgoLocal(1), action:"Vytvorené", userId:"rado", prevContent:"", prevTitle:"", prevStatus:""}], isDemo:true},
+];
+
+const INITIAL_POSTS = [
+  {id:"p1", content:"Verzia 4.0 je live — pridaná plná správa checklistov a IndexedDB.", type:"task", pinned:false, authorId:"tajfun", date:daysAgoLocal(0), topicId:"t1", checklist:[{text:"Skontrolovať logy", done:true},{text:"Otestovať IndexedDB upload", done:false}], isDemo:true},
+];
+
+const INITIAL_CHAT = [
+  {id:"c1", userId:"konyk", text:"Toto je ukážkový chat — demo správa", time: new Date(Date.now()-1000*60*12).toISOString(), isDemo:true},
+];
+
+function App(){
+  const [theme, setTheme] = usePersistentState('admin_hub_theme_v6', 'light');
+  React.useEffect(()=>{ document.documentElement.classList.toggle('dark', theme==='dark'); }, [theme]);
+
+  const [auth, setAuth] = usePersistentState('admin_hub_auth_v6_secure', null);
+  const [currentUserId, setCurrentUserId] = usePersistentState('admin_hub_current_user_v6', null);
+  const [sessionExpiry, setSessionExpiry] = usePersistentState('admin_hub_session_expiry_v6', null);
+  const currentUser = USERS.find(u=>u.id===currentUserId) || null;
+
+  React.useEffect(()=>{
+    const check = ()=>{
+      if(!currentUserId) return;
+      if(!isSessionValid(currentUserId, sessionExpiry)){ setCurrentUserId(null); setSessionExpiry(null); }
+    };
+    check();
+    const id = setInterval(check, 60*1000);
+    return ()=>clearInterval(id);
+  }, [currentUserId, sessionExpiry]);
+
+  const PF={onFail:(m)=>showToast('❌ Zápis zlyhal: '+m+' — zmena vrátená','error')};
+  const [docs, setDocs, docsError] = usePersistentState('admin_hub_docs_v6', INITIAL_DOCS, {onSaved:()=>flushPending(true), onFail:(m)=>flushPending(false,m)});
+  const [blogs, setBlogs] = usePersistentState('admin_hub_blogs_v6', INITIAL_BLOGS, PF);
+  const [posts, setPosts] = usePersistentState('admin_hub_posts_v6', INITIAL_POSTS, PF);
+  const [topics, setTopics] = usePersistentState('admin_hub_topics_v6', INITIAL_TOPICS, PF);
+  const [chat, setChat] = usePersistentState('admin_hub_chat_v6', INITIAL_CHAT, PF);
+  const [activity, setActivity] = usePersistentState('admin_hub_activity_v6', [{id:'a1', text:'Systém v6 inicializovaný', time:new Date().toISOString(), userId:'konyk'}]);
+  const [showDemoData, setShowDemoData] = usePersistentState('admin_hub_show_demo_v6', true);
+  const [documentQuery, setDocumentQuery] = React.useState('');
+  const [documentTypeFilter, setDocumentTypeFilter] = React.useState('all');
+  const [documentAuthorFilter, setDocumentAuthorFilter] = React.useState('all');
+  const [documentDateFrom, setDocumentDateFrom] = React.useState('');
+  const [documentDateTo, setDocumentDateTo] = React.useState('');
+  const [documentSort, setDocumentSort] = React.useState('newest');
+
+  const [section, setSection] = React.useState('dashboard');
+  const [mobileMenu, setMobileMenu] = React.useState(false);
+
+  const [searchQ, setSearchQ] = React.useState('');
+  const [searchDate, setSearchDate] = React.useState('all');
+  const [searchDateFrom, setSearchDateFrom] = React.useState('');
+  const [searchDateTo, setSearchDateTo] = React.useState('');
+  const [searchTags, setSearchTags] = React.useState([]);
+  const [searchStatus, setSearchStatus] = React.useState('all');
+  const [searchContentType, setSearchContentType] = React.useState('all');
+  const [postTypeFilter, setPostTypeFilter] = React.useState('all');
+  const [authorFilter, setAuthorFilter] = React.useState('all');
+  const [pinnedOnly, setPinnedOnly] = React.useState(false);
+
+  const [loginUser, setLoginUser] = React.useState('konyk');
+  const [loginPw, setLoginPw] = React.useState('');
+  const [loginError, setLoginError] = React.useState('');
+  const [setupPasswords, setSetupPasswords] = React.useState({});
+  const [isSettingUp, setIsSettingUp] = React.useState(false);
+  const [oldPw, setOldPw] = React.useState('');
+  const [newPw, setNewPw] = React.useState('');
+  const [showPreview, setShowPreview] = React.useState(null);
+  const [previewData, setPreviewData] = React.useState({html:'', csvRows:[], xlsxRows:[], docxHtml:'', resolvedContent:''});
+  const [readingBlog, setReadingBlog] = React.useState(null);
+  const [editingBlog, setEditingBlog] = React.useState(null);
+  const [editingTopic, setEditingTopic] = React.useState(null);
+  const [editingPost, setEditingPost] = React.useState(null);
+  const [chatInput, setChatInput] = React.useState('');
+  const [blogDraft, setBlogDraft] = React.useState({title:'', excerpt:'', content:'', categoryId:'t1', status:'koncept', seoTags:''});
+  const [postDraft, setPostDraft] = React.useState({content:'', type:'info', topicId:'t1', checklistText:''});
+  const [newCheckItemText, setNewCheckItemText] = React.useState('');
+  const [tagEditDocId, setTagEditDocId] = React.useState(null);
+  const [tagEditValue, setTagEditValue] = React.useState('');
+  const [toast, setToast] = React.useState(null);
+
+  React.useEffect(()=>{ if(!auth) setIsSettingUp(true); }, [auth]);
+
+  React.useEffect(()=>{
+    const handler = (e)=>{ if((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==='k'){ e.preventDefault(); setSection('search'); setTimeout(()=>document.getElementById('search-input')?.focus(),100); } };
+    window.addEventListener('keydown', handler);
+    return ()=>window.removeEventListener('keydown', handler);
+  }, []);
+
+  React.useEffect(()=>{
+    const handleHash = ()=>{
+      const hash=window.location.hash;
+      if(hash.startsWith('#doc-')){
+        const id=hash.replace('#doc-','');
+        const doc=docs.find(d=>d.id===id);
+        if(doc){
+          setSection('documents');
+          setShowPreview(doc);
+        }
+      }
+    };
+    handleHash();
+    window.addEventListener('hashchange', handleHash);
+    return ()=>window.removeEventListener('hashchange', handleHash);
+  }, [docs]);
+
+  const showToast = (msg, type='info')=>{ setToast({msg,type}); setTimeout(()=>setToast(null),5000); };
+  const addActivity = (text)=>{ const entry={id:'a'+Date.now(), text, time:new Date().toISOString(), userId: currentUserId||'system'}; setActivity(prev=>[entry,...prev].slice(0,100)); };
+
+  // Auth
+  const handleSetup = async()=>{
+    for(let u of USERS){ if(!setupPasswords[u.id] || setupPasswords[u.id].length<8){ alert(`Heslo pre ${u.name} musí mať min. 8 znakov`); return; } }
+    const hashed={};
+    for(let u of USERS){ hashed[u.id]=await makeCred(setupPasswords[u.id]); }
+    setAuth(hashed);
+    setIsSettingUp(false);
+    addActivity('Nastavené PBKDF2 heslá v6');
+  };
+  const handleLogin = async()=>{
+    if(!auth || !auth[loginUser]){ setLoginError('Najprv nastav heslá'); return; }
+    let cred = auth[loginUser];
+    if(await verifyCred(loginPw, cred)){
+      // PBKDF2 OK
+    }else if(await verifyLegacySha256(loginPw, cred)){
+      // Legacy SHA-256 — automatický upgrade na PBKDF2 (migračný krok)
+      const nc = await makeCred(loginPw);
+      setAuth(prev=>({...prev,[loginUser]:nc}));
+    }else{
+      setLoginError('Nesprávne heslo');
+      return;
+    }
+    setCurrentUserId(loginUser);
+      const expiry=new Date(); expiry.setHours(expiry.getHours()+8);
+      setSessionExpiry(expiry.toISOString());
+      setLoginError('');
+      addActivity(`Prihlásenie: ${loginUser}${cred && !cred.salt ? ' (upgrade SHA-256→PBKDF2)' : ''}`);
+    }
+  const handleLogout = ()=>{ addActivity(`Odhlásenie: ${currentUserId}`); setCurrentUserId(null); setSessionExpiry(null); setLoginPw(''); setMobileMenu(false); };
+  const handleChangePassword = async()=>{
+    if(!oldPw || !newPw){ alert('Zadaj staré aj nové heslo'); return; }
+    if(newPw.length<8){ alert('Nové heslo musí mať min. 8 znakov'); return; }
+    if(!(await verifyCred(oldPw, auth[currentUserId]))){ alert('Staré heslo nesedí'); return; }
+    const nc2=await makeCred(newPw); setAuth(prev=>({...prev, [currentUserId]:nc2}));
+    setOldPw(''); setNewPw('');
+    addActivity(`Zmena hesla: ${currentUserId}`);
+    showToast('Heslo zmenené (PBKDF2 + soľ)');
+  };
+
+  // Zjednodušený a čistý guard bez duplicitných podmienok
+  const guard = (action, ownerId=null)=>{
+    if(!currentUser) return false;
+    const allowed=can(currentUser.role, action, ownerId, currentUserId);
+    if(!allowed){ showToast(`⛔ Rola ${currentUser.role} nemá oprávnenie: ${action}`, 'error'); return false; }
+    return true;
+  };
+
+  // Pomocná funkcia na načítanie binárky (z IndexedDB alebo priamo z objektu)
+  const resolveDocContent = async(doc, versionIdx=null)=>{
+    if(!doc) return '';
+    if(doc.hostingStorage){
+      try{return await blobAsDataURL(await getHostingBlob(doc,versionIdx));}
+      catch(e){showToast('Načítanie dokumentu z hostingu zlyhalo: '+(e?.message||e),'error');return '';}
+    }
+    if(versionIdx !== null){
+      const ver = doc.versions?.[versionIdx];
+      if(!ver) return '';
+      if(ver.currentContent) return ver.currentContent;
+      if(ver.hasIdbBlob){
+        try{ return (await idbGet(`${doc.id}_v${ver.version}`)) || ''; }catch(e){ return ''; }
+      }
+      return '';
+    }
+    if(doc.currentContent) return doc.currentContent;
+    if(doc.hasIdbBlob){
+      try{ return (await idbGet(doc.id)) || ''; }catch(e){ return ''; }
+    }
+    return '';
+  };
+
+  // Docs upload s primárnym uložením binárok do IndexedDB + extrakcia textu pre vyhľadávanie
+  const docsRef=React.useRef(docs); docsRef.current=docs;
+  const pendingUploads=React.useRef([]);
+  const [hostingStatus,setHostingStatus]=React.useState(getHostingToken() ? 'Heslo úložiska uložené v tejto karte' : 'Nepripojené');
+  const [hostingBusy,setHostingBusy]=React.useState(false);
+  const flushPending=(ok,msg)=>{ const n=pendingUploads.current; if(!n.length) return; pendingUploads.current=[]; if(ok) showToast(`Lokálne zmeny metadát uložené: ${n.join(', ')}`); else { showToast(`❌ Zápis zlyhal (${msg}) — zmena vrátená: ${n.join(', ')}`,'error'); addActivity(`Zlyhanie zápisu: ${n.join(', ')}`); } };
+
+  const syncHostingDocuments = async({quiet=false, forcePrompt=false}={})=>{
+    if(hostingBusy) return false;
+    setHostingBusy(true);
+    try{
+      if(forcePrompt){ try{sessionStorage.removeItem(HOSTING_TOKEN_KEY);}catch(e){} }
+      const response=await hostingRequest();
+      const payload=await response.json();
+      const remotes=(payload.documents||[]).map(fromHostingDocument);
+      const merged=[...docsRef.current.filter(d=>!d.hostingStorage), ...remotes];
+      docsRef.current=merged;
+      setDocs(merged);
+      setHostingStatus(`Pripojené · ${remotes.length} súborov na hostingu`);
+      if(!quiet) showToast(`Hosting synchronizovaný: ${remotes.length} dokumentov`);
+      return true;
+    }catch(e){
+      const msg=e?.message||String(e);
+      setHostingStatus('Chyba pripojenia');
+      if(!quiet) showToast('Hostingové úložisko: '+msg,'error');
+      return false;
+    }finally{setHostingBusy(false);}
+  };
+
+  const getHostingBlob = async(doc, versionIdx=null)=>{
+    const params=new URLSearchParams({id:String(doc.remoteId||doc.id.replace(/^hosting-/,''))});
+    if(versionIdx!==null){const v=doc.versions?.[versionIdx];if(!v) throw new Error('Verzia neexistuje');params.set('version',String(v.version));}
+    const response=await hostingRequest('?'+params.toString());
+    return await response.blob();
+  };
+
+  const handleDeleteDoc = async(doc)=>{
+    if(!guard('delete_doc',doc.authorId)) return;
+    if(!confirm('Zmazať dokument aj jeho verzie?')) return;
+    try{
+      if(doc.hostingStorage){
+        const params=new URLSearchParams({id:String(doc.remoteId||doc.id.replace(/^hosting-/,''))});
+        await hostingRequest('?'+params.toString(),{method:'DELETE'});
+        await syncHostingDocuments({quiet:true});
+      }else{
+        try{await idbDel(doc.id);for(const v of (doc.versions||[]))await idbDel(`${doc.id}_v${v.version}`);}catch(e){}
+        const next=docsRef.current.filter(x=>x.id!==doc.id);docsRef.current=next;setDocs(next);
+      }
+      addActivity(`Zmazané ${doc.name}`);showToast(`Zmazaný dokument: ${doc.name}`);
+    }catch(e){showToast('Zmazanie zlyhalo: '+(e?.message||e),'error');}
+  };
+
+  const handleFileUpload = async (files, source='button')=>{
+    if(!files||files.length===0) return;
+    if(!guard('upload_doc')) return;
+    const accepted=[];
+    setHostingBusy(true);
+    try{
+      for(const file of Array.from(files)){
+        const ext=file.name.split('.').pop().toLowerCase();
+        if(!ALLOWED_EXTS.includes(ext)){showToast(`Typ .${ext} nie je povolený`,'error');continue;}
+        if(file.size>MAX_FILE){showToast(`❌ ${file.name} (${formatSize(file.size)}) presahuje limit ${formatSize(MAX_FILE)}`,'error');continue;}
+        try{
+          const fType=getFileType(file.name);
+          const localData=await new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>res(r.result);r.onerror=()=>rej(new Error('Čítanie súboru zlyhalo'));r.readAsDataURL(file);});
+          const extractedText=await extractSearchableText(fType,localData);
+          const form=new FormData();
+          form.append('file',file,file.name);
+          form.append('authorId',currentUserId||'unknown');
+          form.append('authorName',documentUserName(currentUserId));
+          form.append('extractedText',String(extractedText||'').slice(0,50000));
+          const response=await hostingRequest('?action=upload',{method:'POST',body:form});
+          const payload=await response.json();
+          if(!payload.document) throw new Error('Server nevrátil metadáta dokumentu.');
+          accepted.push(file.name);
+          const normalized=fromHostingDocument(payload.document);
+          const current=docsRef.current.filter(d=>!(d.hostingStorage && d.remoteId===normalized.remoteId));
+          const next=[...current,normalized];
+          docsRef.current=next;setDocs(next);
+        }catch(e){showToast(`Upload na hosting zlyhal pre ${file.name}: ${e?.message||e}`,'error');}
+      }
+      if(accepted.length){
+        setHostingStatus('Pripojené · posledné nahratie úspešné');
+        addActivity(`Nahrané na hosting: ${accepted.join(', ')} via ${source}`);
+        showToast(`Nahrané do hostingu: ${accepted.join(', ')}`);
+        await syncHostingDocuments({quiet:true});
+      }
+    }finally{setHostingBusy(false);}
+  };
+
+  const handleDownload = async (doc, versionIdx=null)=>{
+    const ver = versionIdx!==null ? doc.versions?.[versionIdx] : null;
+    const dot=doc.name.lastIndexOf('.');
+    const name = ver ? (dot>0 ? `${doc.name.slice(0,dot)}.v${ver.version}${doc.name.slice(dot)}` : `${doc.name}.v${ver.version}`) : doc.name;
+    try{
+      if(doc.hostingStorage){
+        const blob=await getHostingBlob(doc,versionIdx);
+        const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),30000);addActivity(`Stiahnuté z hostingu: ${name}`);return;
+      }
+      const content = await resolveDocContent(doc, versionIdx);
+      if(!content){ showToast(ver ? 'Táto verzia nemá uložený obsah' : (doc.isDemo ? 'DEMO dokument nemá binárku' : 'Dokument nemá obsah'),'error'); return; }
+      const a=document.createElement('a');a.href=content;a.download=name;document.body.appendChild(a);a.click();a.remove();addActivity(`Stiahnuté: ${name}`);
+    }catch(e){showToast('Download zlyhal: '+(e?.message||e),'error');}
+  };
+
+  const handleRestoreVersion = async (doc, idx)=>{
+    if(!guard('restore_version', doc.authorId)) return;
+    const ver=doc.versions?.[idx];
+    if(doc.hostingStorage){
+      if(!ver){showToast('Verzia neexistuje','error');return;}
+      if(!confirm(`Obnoviť v${ver.version} z hostingu? Aktuálna verzia bude zachovaná v histórii.`)) return;
+      try{
+        const params=new URLSearchParams({action:'restore'});
+        const response=await hostingRequest('?'+params.toString(),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:String(doc.remoteId||doc.id.replace(/^hosting-/,'')),version:Number(ver.version),authorId:currentUserId||'unknown'})});
+        await response.json();await syncHostingDocuments({quiet:true});showToast(`Obnovená verzia ${ver.version}: ${doc.name}`);addActivity(`Obnovená vzdialená verzia ${doc.name} v${ver.version}`);
+      }catch(e){showToast('Obnovenie z hostingu zlyhalo: '+(e?.message||e),'error');}
+      return;
+    }
+
+    const verContent = await resolveDocContent(doc, idx);
+    if(!ver||!verContent){ showToast('Táto verzia nemá uložený obsah — obnova zrušená.','error'); return; }
+    if(!confirm(`Obnoviť v${ver.version} z ${ver.date}? Aktuálny obsah sa uloží ako nová verzia.`)) return;
+    const currentBlob = await resolveDocContent(doc);
+    const verNo = nextVersionNo(doc);
+    let hasIdb = false;
+    try{
+      if(currentBlob) await idbPut(`${doc.id}_v${verNo}`, currentBlob);
+      await idbPut(doc.id, verContent);
+      hasIdb = true;
+    }catch(e){ hasIdb = false; }
+
+    const upd = restoreVersionPure(
+      {...doc, currentContent: hasIdb ? '' : currentBlob, hasIdbBlob: hasIdb},
+      idx, currentUserId, getLocalToday()
+    );
+    if(upd){
+      upd.currentContent = hasIdb ? '' : verContent;
+      upd.hasIdbBlob = hasIdb;
+      upd.extractedText = await extractSearchableText(doc.type, verContent);
+      pendingUploads.current=[`${doc.name} (obnovená v${ver.version})`];
+      docsRef.current=docsRef.current.map(d=>d.id===doc.id?upd:d); setDocs(docsRef.current);
+      addActivity(`Obnovená verzia ${doc.name} v${ver.version}`);
+    }
+  };
+
+  const handleCopyContent = async(doc)=>{
+    const content = await resolveDocContent(doc);
+    try{
+      if(!content){ await navigator.clipboard.writeText(doc.name); showToast('Skopírovaný názov (bez obsahu)'); return; }
+      if(['txt','html','csv'].includes(doc.type)){
+        const base64=dataURLtoBase64(content);
+        const text=base64ToUtf8(base64);
+        await navigator.clipboard.writeText(text);
+        showToast('Skopírovaný textový obsah s diakritikou');
+        addActivity(`Kopírovaný obsah: ${doc.name}`);
+      }else if(doc.extractedText){
+        await navigator.clipboard.writeText(doc.extractedText);
+        showToast('Skopírovaný extrahovaný text z dokumentu');
+      }else{
+        await navigator.clipboard.writeText(`Súbor: ${doc.name} (${doc.size}) - binárny, použite Stiahnuť`);
+        showToast('Binárny — skopírovaný popis');
+      }
+    }catch(e){ showToast('Clipboard chyba: '+e.message,'error'); }
+  };
+
+  const handleCopyLink = async(doc)=>{
+    try{
+      const shareable=`${window.location.origin}${window.location.pathname}#doc-${doc.id}`;
+      await navigator.clipboard.writeText(shareable);
+      showToast(`Link: ${shareable} (v tomto prehliadači)`);
+      addActivity(`Link kopírovaný: ${doc.name}`);
+    }catch(e){ showToast('Link zlyhal','error'); }
+  };
+
+  const handleAddTags = (docId)=>{
+    const doc=docs.find(d=>d.id===docId);
+    if(!doc) return; if(!guard('edit_tags', doc.authorId)) return;
+    const tags=tagEditValue.split(',').map(s=>s.trim()).filter(Boolean);
+    setDocs(prev=>prev.map(d=> d.id===docId ? {...d, tags} : d));
+    setTagEditDocId(null);
+    setTagEditValue('');
+    addActivity(`Tagy upravené: ${doc.name} → ${tags.join(',')}`);
+  };
+
+  // Blogs — so sanitizáciou HTML pri vytvorení aj úprave a limitom histórie
+  const handleCreateBlog = ()=>{
+    if(!guard('create_blog')) return;
+    if(!blogDraft.title.trim()){ alert('Zadaj názov blogu'); return; } const cat=effCat(); if(!cat){ alert('Najprv vytvor tému'); return; }
+    const cleanHtml = sanitizeHtml(blogDraft.content||'<p>Obsah</p>');
+    const newBlog={id:'b'+Date.now(), title:blogDraft.title.trim(), excerpt:blogDraft.excerpt.trim(), content:cleanHtml, categoryId:cat, authorId:currentUserId, status:blogDraft.status, seoTags:blogDraft.seoTags.split(',').map(s=>s.trim()).filter(Boolean), date:getLocalToday(), readTime:'3 min', history:[{date:getLocalToday(), action:'Vytvorené', userId:currentUserId, prevContent:'', prevTitle:'', prevStatus:'', prevExcerpt:''}], isDemo:false};
+    setBlogs(prev=>[...prev, newBlog]);
+    setBlogDraft({title:'', excerpt:'', content:'', categoryId:'t1', status:'koncept', seoTags:''});
+    addActivity(`Blog vytvorený: ${newBlog.title}`);
+  };
+  const handleUpdateBlog = ()=>{
+    if(!guard('edit_blog', editingBlog.authorId)) return;
+    const cleanEdited = {...editingBlog, content: sanitizeHtml(editingBlog.content)};
+    setBlogs(prev=>prev.map(b=>{
+      if(b.id!==cleanEdited.id) return b;
+      const entry={date:getLocalToday(), action:`Upravené na ${cleanEdited.status}`, userId:currentUserId, ...makeBlogSnapshot(b)};
+      return {...cleanEdited, history:[...(b.history||[]), entry].slice(-MAX_BLOG_HISTORY)};
+    }));
+    addActivity(`Blog upravený: ${cleanEdited.title}`);
+    setEditingBlog(null);
+  };
+  const handleRestoreBlogVersion = (blogId, idx)=>{
+    const blog=blogs.find(b=>b.id===blogId); if(!blog) return;
+    const entry=blog.history[idx];
+    if(!entry || entry.prevContent===undefined || entry.action==='Vytvorené'){ showToast('Táto položka nie je obnoviteľná verzia','error'); return; }
+    if(!guard('edit_blog', blog.authorId)) return;
+    setBlogs(prev=>prev.map(b=> b.id===blogId ? {
+      ...b,
+      title:entry.prevTitle ?? b.title,
+      content:sanitizeHtml(entry.prevContent),
+      status:entry.prevStatus||b.status,
+      excerpt:entry.prevExcerpt ?? b.excerpt,
+      seoTags:entry.prevSeoTags ?? b.seoTags,
+      categoryId:entry.prevCategoryId ?? b.categoryId,
+      history:[...(b.history||[]),{date:getLocalToday(), action:`Obnovené z ${entry.date}`, userId:currentUserId, ...makeBlogSnapshot(b)}].slice(-MAX_BLOG_HISTORY)
+    } : b));
+    addActivity(`Blog obnovený: ${blog.title} z ${entry.date}`);
+  };
+
+  const blogContentRef=React.useRef(null);
+  const insertAtCursor = (before, after='', placeholder='text')=>{
+    if(!editingBlog) return;
+    const ta=blogContentRef.current;
+    if(!ta){ setEditingBlog({...editingBlog, content: editingBlog.content + before + placeholder + after}); return; }
+    const start=ta.selectionStart; const end=ta.selectionEnd;
+    const selected=editingBlog.content.substring(start,end)||placeholder;
+    const newContent=editingBlog.content.substring(0,start)+before+selected+after+editingBlog.content.substring(end);
+    setEditingBlog({...editingBlog, content:newContent});
+    setTimeout(()=>{ ta.focus(); ta.setSelectionRange(start+before.length, start+before.length+selected.length); },0);
+  };
+  const handleFormat = (type)=>{
+    if(type==='b') insertAtCursor('<strong>','</strong>','tučný');
+    if(type==='i') insertAtCursor('<em>','</em>','kurzíva');
+    if(type==='h2') insertAtCursor('<h2>','</h2>','Nadpis');
+    if(type==='ul') insertAtCursor('<ul><li>','</li></ul>','položka');
+    if(type==='link'){
+      const rawUrl=prompt('Zadaj bezpečnú URL (https://...)', 'https://');
+      if(!rawUrl) return;
+      const safeUrl = sanitizeUrl(rawUrl);
+      if(!safeUrl){ alert('Neplatná URL. Povolené sú len platné http:// alebo https:// odkazy.'); return; }
+      insertAtCursor(`<a href="${safeUrl}" target="_blank" rel="noopener noreferrer">`, '</a>', 'odkaz');
+    }
+  };
+
+  // Topics
+  const handleCreateTopic = (name, desc)=>{
+    if(!guard('create_topic')) return;
+    const color='#'+Math.floor(Math.random()*16777215).toString(16).padStart(6,'0');
+    const nt={id:'t'+Date.now(), name, desc, color, icon:'◍', isDemo:false};
+    setTopics(prev=>[...prev, nt]);
+    addActivity(`Téma vytvorená: ${name}`);
+  };
+  const handleUpdateTopic = ()=>{
+    if(!guard('edit_topic')) return;
+    setTopics(prev=>prev.map(t=> t.id===editingTopic.id ? editingTopic : t));
+    addActivity(`Téma upravená: ${editingTopic.name}`);
+    setEditingTopic(null);
+  };
+  const handleDeleteTopic = (id)=>{
+    if(!guard('delete_topic')) return;
+    const used=blogs.filter(b=>b.categoryId===id).length+posts.filter(p=>p.topicId===id).length;
+    if(used>0){ showToast(`Téma má ${used} priradených položiek — najprv ich presuň alebo zmaž`,'error'); return; }
+    if(!confirm('Zmazať tému?')) return;
+    setTopics(prev=>prev.filter(t=>t.id!==id));
+    addActivity(`Téma zmazaná: ${id}`);
+  };
+
+  // Posts CRUD + plná správa checklistu pri vytváraní aj editácii
+  const handleCreatePost = ()=>{
+    if(!guard('create_post')) return;
+    if(!postDraft.content.trim()){ alert('Zadaj obsah príspevku'); return; }
+    const tp=effTopic(); if(!tp){ alert('Najprv vytvor tému'); return; }
+    const checklist = (postDraft.checklistText||'')
+      .split(/\r?\n|,/)
+      .map(s=>s.trim())
+      .filter(Boolean)
+      .map(text=>({text, done:false}));
+    const newPost={id:'p'+Date.now(), content:postDraft.content.trim(), type:postDraft.type, pinned:false, authorId:currentUserId, date:getLocalToday(), topicId:tp, checklist, isDemo:false};
+    setPosts(prev=>[...prev, newPost]);
+    setPostDraft({content:'', type:'info', topicId:'t1', checklistText:''});
+    addActivity(`Príspevok vytvorený (${checklist.length} úloh)`);
+  };
+  const handleUpdatePost = ()=>{
+    if(!guard('edit_post', editingPost.authorId)) return;
+    setPosts(prev=>prev.map(p=> p.id===editingPost.id ? editingPost : p));
+    setEditingPost(null);
+    setNewCheckItemText('');
+    addActivity(`Príspevok upravený: ${editingPost.id}`);
+  };
+  const handleDeletePost = (id)=>{
+    const post=posts.find(p=>p.id===id);
+    if(!guard('delete_post', post?.authorId)) return;
+    if(!confirm('Zmazať príspevok?')) return;
+    setPosts(prev=>prev.filter(p=>p.id!==id));
+    addActivity(`Príspevok zmazaný: ${id}`);
+  };
+  const handleTogglePin = (id)=>{
+    const post=posts.find(p=>p.id===id);
+    if(!guard('pin_post', post?.authorId)) return;
+    setPosts(prev=>prev.map(p=> p.id===id ? {...p, pinned:!p.pinned} : p));
+    addActivity(`${post?.pinned ? 'Odpinovaný' : 'Pripnutý'}: ${id}`);
+  };
+  const handleToggleCheck = (postId, idx)=>{
+    const post=posts.find(p=>p.id===postId);
+    if(!post) return;
+    if(!guard('manage_checklist', post.authorId)) return;
+    setPosts(prev=>prev.map(p=> p.id===postId ? {...p, checklist: (p.checklist||[]).map((c,i)=> i===idx ? {...c, done:!c.done} : c)} : p));
+    addActivity(`Checklist ${postId}[${idx}]`);
+  };
+
+  const handleSendChat = ()=>{
+    if(!chatInput.trim()) return;
+    if(!guard('chat')) return;
+    const msg={id:'c'+Date.now(), userId:currentUserId, text:chatInput.trim(), time:new Date().toISOString(), isDemo:false};
+    setChat(prev=>[...prev, msg].slice(-MAX_CHAT_MESSAGES));
+    setChatInput('');
+    addActivity(`Chat: ${chatInput.slice(0,30)}`);
+  };
+
+  const isDateMatch = (itemDate)=>{
+    if(searchDate==='all') return true;
+    if(searchDate==='today') return itemDate===TODAY;
+    if(searchDate==='week'){ const r=getWeekRangeLocal(TODAY); return itemDate>=r.from && itemDate<=r.to; }
+    if(searchDate==='month'){ const r=getMonthRangeLocal(TODAY); return itemDate>=r.from && itemDate<=r.to; }
+    if(searchDate==='custom'){
+      if(searchDateFrom && searchDateTo) return itemDate>=searchDateFrom && itemDate<=searchDateTo;
+      if(searchDateFrom && !searchDateTo) return itemDate>=searchDateFrom;
+      if(!searchDateFrom && searchDateTo) return itemDate<=searchDateTo;
+      return true;
+    }
+    return true;
+  };
+
+  // Oprava: Rýchle fulltext vyhľadávanie cez pred-extrahovaný text (vrátane DOCX a XLSX) bez Base64 dekódovania v render slučke
+  const filteredDocs = docs.filter(d=>{
+    if(!showDemoData && d.isDemo) return false;
+    const q=searchQ.toLowerCase();
+    const matchText=!q || d.name.toLowerCase().includes(q) || (d.tags||[]).some(t=>t.toLowerCase().includes(q)) || (d.extractedText && d.extractedText.toLowerCase().includes(q));
+    const matchTags=searchTags.length===0 || searchTags.some(tag=> (d.tags||[]).map(x=>x.toLowerCase()).includes(tag.toLowerCase()) || d.name.toLowerCase().includes(tag.toLowerCase()));
+    const matchDate=isDateMatch(d.date);
+    const matchAuthor=authorFilter==='all' || d.authorId===currentUserId;
+    if(searchContentType!=='all' && searchContentType!=='doc') return false;
+    return matchText && matchTags && matchDate && matchAuthor;
+  });
+  const filteredBlogs = blogs.filter(b=>{
+    if(!showDemoData && b.isDemo) return false;
+    const q=searchQ.toLowerCase();
+    const matchText=!q || b.title.toLowerCase().includes(q) || b.excerpt.toLowerCase().includes(q) || b.content.toLowerCase().includes(q) || (b.seoTags||[]).some(t=>t.toLowerCase().includes(q));
+    const matchTags=searchTags.length===0 || searchTags.some(tag=> (b.seoTags||[]).map(x=>x.toLowerCase()).includes(tag.toLowerCase()));
+    const matchStatus=searchStatus==='all' || b.status===searchStatus;
+    const matchDate=isDateMatch(b.date);
+    const matchAuthor=authorFilter==='all' || b.authorId===currentUserId;
+    if(searchContentType!=='all' && searchContentType!=='blog') return false;
+    return matchText && matchTags && matchStatus && matchDate && matchAuthor;
+  });
+  const filteredPosts = posts.filter(p=>{
+    if(!showDemoData && p.isDemo) return false;
+    const q=searchQ.toLowerCase();
+    const matchText=!q || p.content.toLowerCase().includes(q) || (p.checklist||[]).some(c=>c.text.toLowerCase().includes(q));
+    const matchTags=searchTags.length===0 || searchTags.some(tag=>{ const topic=topics.find(t=>t.id===p.topicId); return p.content.toLowerCase().includes(tag.toLowerCase()) || (topic && topic.name.toLowerCase().includes(tag.toLowerCase())); });
+    const matchDate=isDateMatch(p.date);
+    const matchPostType=postTypeFilter==='all' || p.type===postTypeFilter;
+    const matchAuthor=authorFilter==='all' || p.authorId===currentUserId;
+    const matchPinned=!pinnedOnly || p.pinned===true;
+    if(searchContentType!=='all' && searchContentType!=='post') return false;
+    return matchText && matchDate && matchPostType && matchAuthor && matchPinned && matchTags;
+  });
+
+  const topicStats = topics.filter(t=> showDemoData || !t.isDemo).map(t=>{
+    const bc=blogs.filter(b=>(showDemoData||!b.isDemo)&&b.categoryId===t.id).length; const pc=posts.filter(p=>(showDemoData||!p.isDemo)&&p.topicId===t.id).length;
+    return {...t, blogCount:bc, postCount:pc};
+  });
+
+  const visibleTopics=topics.filter(t=> showDemoData || !t.isDemo);
+  const effCat=()=> visibleTopics.some(t=>t.id===blogDraft.categoryId) ? blogDraft.categoryId : (visibleTopics[0]?.id||'');
+  const effTopic=()=> visibleTopics.some(t=>t.id===postDraft.topicId) ? postDraft.topicId : (visibleTopics[0]?.id||'');
+  const resetAllFilters = ()=>{ setSearchQ(''); setSearchDate('all'); setSearchDateFrom(''); setSearchDateTo(''); setSearchTags([]); setSearchStatus('all'); setSearchContentType('all'); setPostTypeFilter('all'); setAuthorFilter('all'); setPinnedOnly(false); };
+
+  const runRealTests = React.useCallback(()=>runAuditTests({auth, docsError}), [auth, docsError]);
+  const [auditTests, setAuditTests] = React.useState([]);
+  React.useEffect(()=>{ runRealTests().then(setAuditTests); }, [runRealTests]);
+
+  // Preview handling pre typy dokumentov (načítava aj z IndexedDB)
+  React.useEffect(()=>{
+    let cancelled = false;
+    if(!showPreview) { setPreviewData({html:'', csvRows:[], xlsxRows:[], docxHtml:'', resolvedContent:''}); return; }
+    (async ()=>{
+      const content = await resolveDocContent(showPreview);
+      if(cancelled) return;
+      if(!content) { setPreviewData({html:'', csvRows:[], xlsxRows:[], docxHtml:'', resolvedContent:''}); return; }
+      if(showPreview.type==='csv'){
+        try{
+          const txt=base64ToUtf8(dataURLtoBase64(content));
+          const parsed=parseCSVRobust(txt);
+          setPreviewData({html:'', csvRows:parsed.rows, xlsxRows:[], docxHtml:'', delimiter:parsed.delimiter, resolvedContent:content});
+        }catch(e){ setPreviewData({html:'', csvRows:[], xlsxRows:[], docxHtml:'', resolvedContent:content, error:'Súbor sa nepodarilo spracovať: '+(e&&e.message||e)}); }
+      }else if(showPreview.type==='xlsx'){
+        try{
+          const bytes=dataURLtoBytes(content);
+          const wb=XLSX.read(bytes, {type:'array'});
+          const firstSheet=wb.Sheets[wb.SheetNames[0]];
+          const rows=XLSX.utils.sheet_to_json(firstSheet, {header:1});
+          setPreviewData({html:'', csvRows:[], xlsxRows:rows.slice(0,50), docxHtml:'', resolvedContent:content});
+        }catch(e){ setPreviewData({html:'', csvRows:[], xlsxRows:[], docxHtml:'', resolvedContent:content, error:'Súbor sa nepodarilo spracovať: '+(e&&e.message||e)}); }
+      }else if(showPreview.type==='docx'){
+        try{
+          const bytes=dataURLtoBytes(content);
+          mammoth.convertToHtml({arrayBuffer: bytes.buffer}).then(res=>{
+            if(!cancelled) setPreviewData({html:'', csvRows:[], xlsxRows:[], docxHtml:sanitizeHtml(res.value), resolvedContent:content});
+          }).catch(()=>!cancelled && setPreviewData({html:'', csvRows:[], xlsxRows:[], docxHtml:'<p>Chyba konverzie DOCX</p>', resolvedContent:content}));
+        }catch(e){ setPreviewData({html:'', csvRows:[], xlsxRows:[], docxHtml:'', resolvedContent:content, error:'Súbor sa nepodarilo spracovať: '+(e&&e.message||e)}); }
+      }else if(showPreview.type==='html'){
+        const txt=base64ToUtf8(dataURLtoBase64(content));
+        setPreviewData({html:txt, csvRows:[], xlsxRows:[], docxHtml:'', resolvedContent:content});
+      }else{
+        setPreviewData({html:'', csvRows:[], xlsxRows:[], docxHtml:'', resolvedContent:content});
+      }
+    })();
+    return ()=>{ cancelled = true; };
+  }, [showPreview]);
+
+  const documentAuthors = [...new Set(docs.map(d=>d.authorId).filter(Boolean))].sort((a,b)=>documentUserName(a).localeCompare(documentUserName(b),'sk'));
+  const visibleDocumentList = docs
+    .filter(d=>showDemoData || !d.isDemo)
+    .filter(d=>{
+      const query=documentQuery.trim().toLocaleLowerCase('sk');
+      const haystack=[d.name,d.type,d.size,d.authorId,documentUserName(d.authorId),(d.tags||[]).join(' '),d.extractedText||''].join(' ').toLocaleLowerCase('sk');
+      if(query && !haystack.includes(query)) return false;
+      if(documentTypeFilter!=='all' && d.type!==documentTypeFilter) return false;
+      if(documentAuthorFilter!=='all' && d.authorId!==documentAuthorFilter) return false;
+      const dt = documentDateValue(d);
+      if(documentDateFrom){ const from=new Date(documentDateFrom+'T00:00:00').getTime(); if(dt<from) return false; }
+      if(documentDateTo){ const to=new Date(documentDateTo+'T23:59:59.999').getTime(); if(dt>to) return false; }
+      return true;
+    })
+    .sort((a,b)=>{
+      const nameA=(a.name||'').toLocaleLowerCase('sk'), nameB=(b.name||'').toLocaleLowerCase('sk');
+      const authorA=documentUserName(a.authorId).toLocaleLowerCase('sk'), authorB=documentUserName(b.authorId).toLocaleLowerCase('sk');
+      const sizeA=Number(String(a.size||'').replace(',','.').match(/[\d.]+/)?.[0]||0) * (/GB/i.test(a.size||'')?1024:(/KB/i.test(a.size||'')?1/1024:1));
+      const sizeB=Number(String(b.size||'').replace(',','.').match(/[\d.]+/)?.[0]||0) * (/GB/i.test(b.size||'')?1024:(/KB/i.test(b.size||'')?1/1024:1));
+      switch(documentSort){
+        case 'oldest': return documentDateValue(a)-documentDateValue(b);
+        case 'name_asc': return nameA.localeCompare(nameB,'sk');
+        case 'name_desc': return nameB.localeCompare(nameA,'sk');
+        case 'size_desc': return sizeB-sizeA;
+        case 'size_asc': return sizeA-sizeB;
+        case 'type_asc': return (a.type||'').localeCompare(b.type||'','sk') || nameA.localeCompare(nameB,'sk');
+        case 'author_asc': return authorA.localeCompare(authorB,'sk') || nameA.localeCompare(nameB,'sk');
+        case 'newest': default: return documentDateValue(b)-documentDateValue(a);
+      }
+    });
+
+  if(isSettingUp){
+    return (
+      <div className="min-h-screen flex items-center justify-center p-6">
+        <div className="w-full max-w-2xl bg-white dark:bg-zinc-900 rounded-2xl shadow-xl p-8 border">
+          <h1 className="text-2xl font-bold mb-2">ADMIN HUB v6.1 — Prvotné nastavenie</h1>
+          <p className="text-sm text-zinc-600 mb-6">PBKDF2 150k + soľ pre lokálne prihlásenie. Dokumenty sa ukladajú na hosting po nakonfigurovaní PHP API.</p>
+          <div className="space-y-4">
+            {USERS.map(u=>(
+              <div key={u.id} className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-full flex items-center justify-center text-white font-bold" style={{background:u.color}}>{u.initials}</div>
+                <div className="flex-1"><div className="text-sm font-medium">{u.name} — {u.role}</div><input type="password" placeholder={`Heslo pre ${u.name} (min. 8 znakov)`} className="mt-1 w-full px-3 py-2 rounded-lg border bg-white dark:bg-zinc-800" value={setupPasswords[u.id]||''} onChange={e=>setSetupPasswords({...setupPasswords, [u.id]:e.target.value})}/></div>
+              </div>
+            ))}
+          </div>
+          <button onClick={handleSetup} className="mt-6 w-full py-3 rounded-xl bg-zinc-900 dark:bg-white text-white dark:text-zinc-900 font-semibold">Uložiť kryptografické hashe</button>
+        </div>
+      </div>
+    );
+  }
+
+  if(!currentUser){
+    return (
+      <div className="min-h-screen flex items-center justify-center p-6">
+        <div className="w-full max-w-md bg-white dark:bg-zinc-900 rounded-2xl shadow-xl p-8 border">
+          <h1 className="text-xl font-bold">ADMIN HUB v6.1</h1>
+          <p className="text-xs mono text-zinc-500 mb-4">Expirácia relácie kontrolovaná priebežne, heslá derivované cez PBKDF2.</p>
+          <select value={loginUser} onChange={e=>setLoginUser(e.target.value)} className="w-full px-3 py-2.5 rounded-xl border bg-white dark:bg-zinc-800 mb-3">{USERS.map(u=><option key={u.id} value={u.id}>{u.name} ({u.role})</option>)}</select>
+          <input type="password" placeholder="Heslo" value={loginPw} onChange={e=>setLoginPw(e.target.value)} onKeyDown={e=>{if(e.key==='Enter') handleLogin();}} className="w-full px-3 py-2.5 rounded-xl border bg-white dark:bg-zinc-800 mb-3"/>
+          {loginError && <div className="text-sm text-red-600 mb-2">{loginError}</div>}
+          <button onClick={handleLogin} className="w-full py-3 rounded-xl bg-zinc-900 dark:bg-white text-white dark:text-zinc-900 font-semibold">Prihlásiť</button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen flex">
+      <div className="w-[270px] hidden lg:flex flex-col border-r bg-white dark:bg-zinc-900 p-4 sticky top-0 h-screen">
+        <div className="flex items-center gap-2 mb-6"><div className="w-8 h-8 rounded-lg bg-zinc-900 dark:bg-white text-white dark:text-zinc-900 flex items-center justify-center font-bold">A</div><div><div className="font-bold leading-none">ADMIN HUB v6</div><div className="text-[10px] mono text-zinc-500">revidovaná verzia</div></div></div>
+        <div className="flex items-center gap-2 px-2 py-2 rounded-xl bg-zinc-50 dark:bg-zinc-800 mb-4"><div className="w-8 h-8 rounded-full flex items-center justify-center text-white font-bold" style={{background:currentUser.color}}>{currentUser.initials}</div><div className="flex-1"><div className="text-sm font-medium">{currentUser.name}</div><div className="text-[11px] text-zinc-500">{currentUser.role} • exp {sessionExpiry ? new Date(sessionExpiry).toLocaleTimeString() : ''}</div></div><button onClick={handleLogout} className="text-xs px-2 py-1 rounded-lg border">Odhlásiť</button></div>
+        <nav className="space-y-1 flex-1">
+          {[{id:'dashboard',label:'Dashboard'},{id:'documents',label:'Dokumenty'},{id:'topics',label:'Témy'},{id:'blogs',label:'Blogy'},{id:'posts',label:'Príspevky'},{id:'chat',label:'Chat'},{id:'search',label:'Vyhľadávanie'},{id:'audit',label:'Audit (reálne testy)'},{id:'settings',label:'Nastavenia'}].map(item=>(
+            <button key={item.id} onClick={()=>setSection(item.id)} className={`w-full text-left px-3 py-2 rounded-xl text-sm ${section===item.id ? 'bg-zinc-900 text-white dark:bg-white dark:text-zinc-900 font-medium' : 'hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-600 dark:text-zinc-400'}`}>{item.label}</button>
+          ))}
+        </nav>
+        <div className="mt-4 p-3 rounded-xl bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800"><div className="text-[11px] font-semibold text-emerald-800 dark:text-emerald-300">REŽIM v6 AKTÍVNY</div><div className="text-[11px] text-emerald-700 dark:text-emerald-400 mt-1">DOMPurify, fulltext TXT/CSV/HTML/DOCX/XLSX/PDF. Dokumenty: serverové PHP úložisko po pripojení; ostatné moduly stále lokálne.</div></div>
+        <button onClick={()=>setTheme(theme==='dark'?'light':'dark')} className="mt-3 text-xs px-3 py-2 rounded-xl border w-full">{theme==='dark' ? '☀️ Svetlý' : '🌙 Tmavý'}</button>
+      </div>
+
+      <div className="flex-1 min-w-0">
+        <div className="sticky top-0 z-20 backdrop-blur bg-white/80 dark:bg-zinc-900/80 border-b px-4 lg:px-8 py-3 flex items-center gap-3">
+          <button onClick={()=>setMobileMenu(!mobileMenu)} className="lg:hidden px-3 py-1.5 rounded-lg border">☰</button>
+          <div className="font-bold lg:hidden">ADMIN HUB v6</div>
+          <div className="flex-1 flex items-center gap-2 max-w-xl"><div className="relative flex-1"><input id="search-input" value={searchQ} onChange={e=>{setSearchQ(e.target.value); if(section!=='search') setSection('search');}} placeholder="Hľadať v názvoch, tagoch, TXT, CSV, HTML, DOCX, XLSX, PDF (PDF fulltext cez PDF.js) (⌘K)" className="w-full pl-9 pr-3 py-2 rounded-xl border bg-zinc-50 dark:bg-zinc-800 text-sm"/><span className="absolute left-3 top-2.5 text-zinc-400">⌕</span></div></div>
+          <div className="hidden md:flex items-center gap-2 text-[11px] mono"><span className="px-2 py-1 rounded-full bg-zinc-100 dark:bg-zinc-800 border">{docs.length} docs</span>{docsError && <span className="px-2 py-1 rounded-full bg-red-50 border border-red-200 text-red-700 max-w-[300px] truncate">{docsError}</span>}</div>
+        </div>
+
+        {mobileMenu && (
+          <div className="lg:hidden p-4 border-b bg-white dark:bg-zinc-900 space-y-2">
+            <div className="grid grid-cols-2 gap-2">{['dashboard','documents','topics','blogs','posts','chat','search','audit','settings'].map(id=><button key={id} onClick={()=>{setSection(id); setMobileMenu(false);}} className={`px-3 py-2 rounded-xl border text-sm ${section===id ? 'bg-zinc-900 text-white' : ''}`}>{id}</button>)}</div>
+            <div className="flex gap-2"><button onClick={handleLogout} className="flex-1 px-3 py-2 rounded-xl border text-sm">Odhlásiť ({currentUser.name})</button><button onClick={()=>{setTheme(theme==='dark'?'light':'dark');}} className="flex-1 px-3 py-2 rounded-xl border text-sm">{theme==='dark' ? '☀️ Svetlý' : '🌙 Tmavý'}</button></div>
+          </div>
+        )}
+
+        {toast && <div className={`fixed bottom-4 right-4 z-50 px-4 py-3 rounded-xl shadow-lg border text-sm max-w-[400px] ${toast.type==='error' ? 'bg-red-50 border-red-200 text-red-800' : 'bg-white dark:bg-zinc-900'}`}>{toast.msg}</div>}
+
+        <div className="px-4 lg:px-8 py-6 max-w-[1200px]">
+
+          {section==='dashboard' && (
+            <div className="space-y-6">
+              <h2 className="text-2xl font-bold">Dashboard v6</h2>
+              <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+                <div className="p-4 rounded-2xl bg-white dark:bg-zinc-900 border"><div className="text-xs text-zinc-500">Dokumenty</div><div className="text-2xl font-bold">{docs.filter(d=> showDemoData || !d.isDemo).length}</div><div className="text-[11px] text-zinc-500">Hosting + lokálne DEMO</div></div>
+                <div className="p-4 rounded-2xl bg-white dark:bg-zinc-900 border"><div className="text-xs text-zinc-500">Blogy</div><div className="text-2xl font-bold">{blogs.filter(b=> showDemoData || !b.isDemo).length}</div><div className="text-[11px] text-zinc-500">sanitizované + čitateľský mód</div></div>
+                <div className="p-4 rounded-2xl bg-white dark:bg-zinc-900 border"><div className="text-xs text-zinc-500">Príspevky</div><div className="text-2xl font-bold">{posts.filter(p=> showDemoData || !p.isDemo).length}</div><div className="text-[11px] text-zinc-500">CRUD + plný checklist editor</div></div>
+                <div className="p-4 rounded-2xl bg-white dark:bg-zinc-900 border"><div className="text-xs text-zinc-500">Dnes (lokálne)</div><div className="text-lg font-bold">{TODAY}</div><div className="text-[11px] text-zinc-500">parsované cez parseLocalYMD</div></div>
+              </div>
+              <div className="p-5 rounded-2xl bg-white dark:bg-zinc-900 border">
+                <h3 className="font-semibold mb-3">Rýchle filtre</h3>
+                <div className="flex flex-wrap gap-2">
+                  <button onClick={()=>{resetAllFilters(); setSearchDate('today'); setSection('search');}} className="px-3 py-2 rounded-xl border text-sm">Dnes</button>
+                  <button onClick={()=>{resetAllFilters(); setSearchDate('week'); setSection('search');}} className="px-3 py-2 rounded-xl border text-sm">Tento týždeň (Po-Ne)</button>
+                  <button onClick={()=>{resetAllFilters(); setAuthorFilter('me'); setSection('search');}} className="px-3 py-2 rounded-xl border text-sm">Moje záznamy</button>
+                  <button onClick={()=>{resetAllFilters(); setPinnedOnly(true); setSearchContentType('post'); setSection('search');}} className="px-3 py-2 rounded-xl border text-sm">Pripnuté</button>
+                  <button onClick={resetAllFilters} className="px-3 py-2 rounded-xl border text-sm bg-zinc-900 text-white">Reset</button>
+                </div>
+              </div>
+              <div className="p-5 rounded-2xl bg-white dark:bg-zinc-900 border">
+                <h3 className="font-semibold mb-2">Témy — dynamické + demo oddelené</h3>
+                <label className="flex items-center gap-2 text-sm mb-3"><input type="checkbox" checked={showDemoData} onChange={e=>setShowDemoData(e.target.checked)}/> Zobraziť demo dáta (t1-t3, d1-d3, b1, p1, chat)</label>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                  {topicStats.map(t=>(
+                    <div key={t.id} className="p-3 rounded-xl border flex justify-between"><div className="flex gap-3"><div className="w-9 h-9 rounded-xl flex items-center justify-center text-white" style={{background:t.color}}>{t.icon}</div><div><div className="text-sm font-medium">{t.name} {t.isDemo && <span className="text-[9px] border px-1 rounded">DEMO</span>}</div><div className="text-[11px] text-zinc-500">{t.blogCount} blogov • {t.postCount} postov</div></div></div><div className="flex gap-1"><button onClick={()=>setEditingTopic(t)} className="text-xs px-2 py-1 rounded-xl border">Edit</button><button onClick={()=>handleDeleteTopic(t.id)} className="text-xs px-2 py-1 rounded-xl border border-red-200 text-red-600">Zmazať</button></div></div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {section==='documents' && (
+            <div className="space-y-5">
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <h2 className="text-2xl font-bold">Dokumenty — obsah, autor, verzie a triedenie</h2>
+                  <p className="text-xs text-zinc-500 mt-1">Súbory sa nahrávajú na webhosting do privátneho priečinka cez PHP API. Po pripojení ich uvidia aj kolegovia; lokálne demo záznamy zostávajú oddelené.</p>
+                  <p className={`text-xs mt-2 ${hostingStatus.startsWith('Pripojené') ? 'text-emerald-600' : 'text-amber-600'}`}>Hosting: {hostingStatus}{hostingBusy ? ' · spracúvam…' : ''}</p>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  <button disabled={hostingBusy} onClick={()=>syncHostingDocuments({quiet:false})} className="px-3 py-2 rounded-xl border text-sm">{hostingBusy?'Pracujem…':'Pripojiť / obnoviť hosting'}</button>
+                  <button onClick={()=>{try{sessionStorage.removeItem(HOSTING_TOKEN_KEY);}catch(e){}setHostingStatus('Nepripojené');showToast('Kľúč úložiska odstránený z tejto karty');}} className="px-3 py-2 rounded-xl border text-sm">Odpojiť</button>
+                  <label className="px-4 py-2 rounded-xl bg-zinc-900 dark:bg-white text-white dark:text-zinc-900 text-sm cursor-pointer">+ Nahrať na hosting<input type="file" multiple className="hidden" accept=".pdf,.jpg,.jpeg,.png,.webp,.gif,.svg,.xlsx,.xls,.csv,.mp4,.mov,.webm,.avi,.docx,.doc,.txt,.md,.html,.htm" onChange={e=>{handleFileUpload(e.target.files,'button');e.target.value='';}}/></label>
+                </div>
+              </div>
+              <div onDragOver={e=>{e.preventDefault();}} onDrop={e=>{ e.preventDefault(); const files=e.dataTransfer.files; const filtered=Array.from(files).filter(f=>{ const ext=f.name.split('.').pop().toLowerCase(); return ALLOWED_EXTS.includes(ext); }); if(filtered.length!==files.length) showToast(`Niektoré súbory odmietnuté — povolené ${ALLOWED_EXTS.join(', ')}`,'error'); handleFileUpload(filtered,'drag-drop'); }} className="p-6 rounded-2xl border-2 border-dashed bg-white dark:bg-zinc-900 text-center"><div className="text-sm font-medium">Presuň sem súbory alebo klikni na „Nahrať“</div><div className="text-xs text-zinc-500">Povolené: {ALLOWED_EXTS.join(', ')} • max. {formatSize(MAX_FILE)} na súbor • cieľ: priečinok admin-hub-storage na hostingu</div>{docsError && <div className="mt-2 text-xs text-red-600">{docsError}</div>}</div>
+
+              <div className="p-4 rounded-2xl border bg-white dark:bg-zinc-900 space-y-3">
+                <div className="flex flex-wrap items-center justify-between gap-2"><div className="font-semibold">Filter a zoradenie</div><div className="text-xs text-zinc-500">Zobrazené: {visibleDocumentList.length} / {docs.filter(d=>showDemoData || !d.isDemo).length}</div></div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                  <label className="text-xs">Hľadať názov, tag, typ alebo obsah
+                    <input value={documentQuery} onChange={e=>setDocumentQuery(e.target.value)} placeholder="Napr. zmluva, faktúra, rozpočet…" className="mt-1 w-full px-3 py-2 rounded-xl border bg-white dark:bg-zinc-800 text-sm" />
+                  </label>
+                  <label className="text-xs">Typ dokumentu
+                    <select value={documentTypeFilter} onChange={e=>setDocumentTypeFilter(e.target.value)} className="mt-1 w-full px-3 py-2 rounded-xl border bg-white dark:bg-zinc-800 text-sm">
+                      <option value="all">Všetky typy</option>{[...new Set(docs.map(d=>d.type).filter(Boolean))].sort().map(t=><option key={t} value={t}>{t.toUpperCase()}</option>)}
+                    </select>
+                  </label>
+                  <label className="text-xs">Nahrávateľ aktuálnej verzie
+                    <select value={documentAuthorFilter} onChange={e=>setDocumentAuthorFilter(e.target.value)} className="mt-1 w-full px-3 py-2 rounded-xl border bg-white dark:bg-zinc-800 text-sm"><option value="all">Všetci používatelia</option>{documentAuthors.map(a=><option key={a} value={a}>{documentUserName(a)}</option>)}</select>
+                  </label>
+                  <label className="text-xs">Nahrané od
+                    <input type="date" value={documentDateFrom} onChange={e=>setDocumentDateFrom(e.target.value)} className="mt-1 w-full px-3 py-2 rounded-xl border bg-white dark:bg-zinc-800 text-sm" />
+                  </label>
+                  <label className="text-xs">Nahrané do
+                    <input type="date" value={documentDateTo} onChange={e=>setDocumentDateTo(e.target.value)} className="mt-1 w-full px-3 py-2 rounded-xl border bg-white dark:bg-zinc-800 text-sm" />
+                  </label>
+                  <label className="text-xs">Zoradiť podľa
+                    <select value={documentSort} onChange={e=>setDocumentSort(e.target.value)} className="mt-1 w-full px-3 py-2 rounded-xl border bg-white dark:bg-zinc-800 text-sm">
+                      <option value="newest">Najnovšie nahrané</option><option value="oldest">Najstaršie nahrané</option><option value="name_asc">Názov A → Z</option><option value="name_desc">Názov Z → A</option><option value="size_desc">Najväčší súbor</option><option value="size_asc">Najmenší súbor</option><option value="type_asc">Typ súboru</option><option value="author_asc">Nahrávateľ A → Z</option>
+                    </select>
+                  </label>
+                </div>
+                <div className="flex flex-wrap gap-2"><button onClick={()=>{setDocumentQuery('');setDocumentTypeFilter('all');setDocumentAuthorFilter('all');setDocumentDateFrom('');setDocumentDateTo('');setDocumentSort('newest');}} className="text-xs px-3 py-1.5 rounded-xl border">Vymazať filtre</button><label className="flex items-center gap-2 text-xs px-2"><input type="checkbox" checked={showDemoData} onChange={e=>setShowDemoData(e.target.checked)} /> Zobraziť demo dokumenty</label></div>
+              </div>
+
+              {visibleDocumentList.length===0 ? <div className="p-8 text-center rounded-2xl border bg-white dark:bg-zinc-900 text-sm text-zinc-500">Žiadne dokumenty nezodpovedajú filtrom.</div> : <div className="grid grid-cols-1 xl:grid-cols-2 gap-3">
+                {visibleDocumentList.map(d=>{
+                  const snippet=documentTextSnippet(d);
+                  const uploadedAt= d.uploadedAt || d.updatedAt || d.createdAt;
+                  return <div key={d.id} id={`doc-${d.id}`} className="p-4 rounded-2xl bg-white dark:bg-zinc-900 border min-w-0">
+                    <div className="flex flex-wrap items-start justify-between gap-3">
+                      <div className="min-w-0 flex-1"><div className="font-semibold text-sm break-words">{d.name} {d.isDemo && <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-900 border">DEMO</span>} {d.hostingStorage && <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-emerald-100 text-emerald-900 border">HOSTING</span>} {d.hasIdbBlob && <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-emerald-100 text-emerald-900 border">INDEXEDDB</span>}</div>
+                        <div className="text-[11px] text-zinc-500 mt-1">Typ: {String(d.type||'súbor').toUpperCase()} · Veľkosť: {d.size||'neznáma'} · Nahrané/aktualizované: {documentDateLabel(d)}</div>
+                        <div className="mt-1 text-xs"><span className="text-zinc-500">Aktuálnu verziu nahral:</span> <strong>{documentUserName(d.authorId)}</strong>{d.createdBy && d.createdBy!==d.authorId ? <span className="text-zinc-500"> · pôvodne: {documentUserName(d.createdBy)}</span> : null}</div>
+                        {d.createdAt && <div className="text-[10px] text-zinc-400 mt-1">Prvýkrát pridané: {new Date(d.createdAt).toLocaleString('sk-SK')}</div>}
+                        <div className="mt-2 flex gap-1 flex-wrap">{(d.tags||[]).map(tag=><span key={tag} className="text-[10px] px-1.5 py-0.5 rounded-full bg-zinc-100 dark:bg-zinc-800 border">{tag}</span>)}{(!d.tags||d.tags.length===0)&&<span className="text-[10px] text-zinc-400">Bez tagov</span>}</div>
+                      </div>
+                      <button onClick={()=>setShowPreview(d)} className="text-xs px-3 py-2 rounded-lg border shrink-0">Otvoriť obsah</button>
+                    </div>
+                    <div className="mt-3 p-3 rounded-xl bg-zinc-50 dark:bg-zinc-800/70 border">
+                      <div className="text-[11px] font-semibold text-zinc-600 dark:text-zinc-300 mb-1">Ukážka obsahu</div>
+                      {snippet ? <div className="text-xs leading-relaxed whitespace-pre-wrap break-words max-h-28 overflow-hidden">{snippet}</div> : <div className="text-xs text-zinc-500">Textový obsah nie je dostupný ako ukážka. Klikni na „Otvoriť obsah“ pre náhľad obrázka, videa alebo PDF, prípadne na stiahnutie.</div>}
+                    </div>
+                    {d.versions && d.versions.length>0 && <details className="mt-3"><summary className="cursor-pointer text-xs font-medium">História verzií ({d.versions.length})</summary><div className="mt-2 text-[11px] bg-zinc-50 dark:bg-zinc-800 p-2 rounded-xl space-y-2">{d.versions.map((v,i)=><div key={i} className="flex flex-wrap justify-between items-center gap-2 border-b last:border-b-0 pb-2 last:pb-0"><span>v{v.version} · {v.date} · {documentUserName(v.authorId)} · {v.size}</span><div className="flex gap-1"><button onClick={()=>handleDownload(d,i)} className="text-[10px] px-2 py-1 rounded-full border">Stiahnuť</button><button onClick={()=>handleRestoreVersion(d,i)} className="text-[10px] px-2 py-1 rounded-full border">Obnoviť</button></div></div>)}</div></details>}
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      <button onClick={()=>handleDownload(d)} className="text-xs px-3 py-1.5 rounded-xl bg-zinc-900 dark:bg-white text-white dark:text-zinc-900">Stiahnuť</button>
+                      <button onClick={()=>handleCopyContent(d)} className="text-xs px-3 py-1.5 rounded-xl border">Kopírovať obsah</button>
+                      <button onClick={()=>handleCopyLink(d)} className="text-xs px-3 py-1.5 rounded-xl border">Lokálny odkaz</button>
+                      {tagEditDocId===d.id ? <div className="flex gap-1"><input value={tagEditValue} onChange={e=>setTagEditValue(e.target.value)} placeholder="tagy čiarkou" className="text-xs px-2 py-1 rounded-lg border bg-white dark:bg-zinc-800"/><button onClick={()=>handleAddTags(d.id)} className="text-xs px-2 py-1 rounded-lg border">Uložiť</button></div> : <button onClick={()=>{setTagEditDocId(d.id);setTagEditValue((d.tags||[]).join(', '));}} className="text-xs px-3 py-1.5 rounded-xl border">Upraviť tagy</button>}
+                      <button onClick={()=>handleDeleteDoc(d)} className="text-xs px-3 py-1.5 rounded-xl border border-red-200 text-red-600">Zmazať</button>
+                    </div>
+                  </div>;
+                })}
+              </div>}
+            </div>
+          )}
+
+          {section==='topics' && (
+            <div className="space-y-5">
+              <div className="flex justify-between"><h2 className="text-2xl font-bold">Témy</h2><button onClick={()=>{ const name=prompt('Názov témy?'); if(name){ const desc=prompt('Popis?')||''; handleCreateTopic(name,desc);} }} className="px-4 py-2 rounded-xl bg-zinc-900 dark:bg-white text-white dark:text-zinc-900 text-sm">+ Nová téma</button></div>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">{topicStats.map(t=><div key={t.id} className="p-4 rounded-2xl bg-white dark:bg-zinc-900 border flex justify-between"><div className="flex gap-3"><div className="w-10 h-10 rounded-xl flex items-center justify-center text-white" style={{background:t.color}}>{t.icon}</div><div><div className="font-medium">{t.name}</div><div className="text-xs text-zinc-500">{t.desc} • {t.blogCount} blogov • {t.postCount} postov</div></div></div><div className="flex gap-1"><button onClick={()=>setEditingTopic(t)} className="text-xs px-3 py-1.5 rounded-xl border">Edit</button><button onClick={()=>handleDeleteTopic(t.id)} className="text-xs px-3 py-1.5 rounded-xl border border-red-200 text-red-600">Zmazať</button></div></div>)}</div>
+              {editingTopic && <div className="fixed inset-0 z-50 bg-black/50 p-6 flex items-center justify-center"><div className="bg-white dark:bg-zinc-900 rounded-2xl p-5 border w-full max-w-md"><input value={editingTopic.name} onChange={e=>setEditingTopic({...editingTopic, name:e.target.value})} className="w-full px-3 py-2 rounded-xl border mb-2 bg-white dark:bg-zinc-800"/><input value={editingTopic.desc} onChange={e=>setEditingTopic({...editingTopic, desc:e.target.value})} className="w-full px-3 py-2 rounded-xl border mb-3 bg-white dark:bg-zinc-800"/><div className="flex gap-2"><button onClick={handleUpdateTopic} className="px-4 py-2 rounded-xl bg-zinc-900 dark:bg-white text-white dark:text-zinc-900">Uložiť</button><button onClick={()=>setEditingTopic(null)} className="px-4 py-2 rounded-xl border">Zrušiť</button></div></div></div>}
+            </div>
+          )}
+
+          {section==='blogs' && (
+            <div className="space-y-5">
+              <h2 className="text-2xl font-bold">Blogy — DOMPurify sanitizácia + čitateľský náhľad + história (max {MAX_BLOG_HISTORY})</h2>
+              <div className="p-4 rounded-2xl bg-white dark:bg-zinc-900 border"><div className="grid grid-cols-1 md:grid-cols-2 gap-3"><input placeholder="Názov" value={blogDraft.title} onChange={e=>setBlogDraft({...blogDraft, title:e.target.value})} className="px-3 py-2 rounded-xl border bg-white dark:bg-zinc-800"/><input placeholder="Excerpt (krátke zhrnutie)" value={blogDraft.excerpt} onChange={e=>setBlogDraft({...blogDraft, excerpt:e.target.value})} className="px-3 py-2 rounded-xl border bg-white dark:bg-zinc-800"/><select value={effCat()} onChange={e=>setBlogDraft({...blogDraft, categoryId:e.target.value})} className="px-3 py-2 rounded-xl border bg-white dark:bg-zinc-800">{topics.filter(t=> showDemoData || !t.isDemo).map(t=><option key={t.id} value={t.id}>{t.name}</option>)}</select><select value={blogDraft.status} onChange={e=>setBlogDraft({...blogDraft, status:e.target.value})} className="px-3 py-2 rounded-xl border bg-white dark:bg-zinc-800"><option value="koncept">koncept</option><option value="publikovaný">publikovaný</option><option value="archív">archív</option></select><input placeholder="SEO tagy (oddelené čiarkou)" value={blogDraft.seoTags} onChange={e=>setBlogDraft({...blogDraft, seoTags:e.target.value})} className="md:col-span-2 px-3 py-2 rounded-xl border bg-white dark:bg-zinc-800"/><textarea placeholder="Obsah HTML (automaticky sanitizovaný cez DOMPurify)" value={blogDraft.content} onChange={e=>setBlogDraft({...blogDraft, content:e.target.value})} className="md:col-span-2 px-3 py-2 rounded-xl border h-24 bg-white dark:bg-zinc-800"></textarea></div><button onClick={handleCreateBlog} className="mt-3 px-4 py-2 rounded-xl bg-zinc-900 dark:bg-white text-white dark:text-zinc-900">Vytvoriť článok</button></div>
+              <div className="space-y-3">{blogs.filter(b=> showDemoData || !b.isDemo).map(b=><div key={b.id} className="p-4 rounded-2xl bg-white dark:bg-zinc-900 border"><div className="flex justify-between items-start"><div className="flex-1"><div className="font-medium">{b.title} {b.isDemo && <span className="text-[9px] border px-1 rounded">DEMO</span>} <span className="text-[10px] border px-1.5 py-0.5 rounded-full ml-2">{b.status}</span></div><div className="text-xs text-zinc-500">{b.excerpt}</div><div className="text-[11px] mono mt-1">{b.date} • {b.authorId} • {(b.seoTags||[]).join(', ')}</div>
+              <div className="mt-3 p-3 rounded-xl bg-zinc-50 dark:bg-zinc-800/60 border text-sm prose prose-sm max-w-none" dangerouslySetInnerHTML={{__html: sanitizeHtml(b.content)}}/>
+              {b.history?.length>0 && <div className="mt-2 text-[11px] bg-zinc-50 dark:bg-zinc-800 p-2 rounded-xl space-y-1">{b.history.map((h,i)=><div key={i} className="flex justify-between"><span>{h.date}: {h.action} ({h.userId}) {h.prevTitle ? `• predch. názov: "${h.prevTitle.slice(0,25)}"` : ''}</span>{h.action!=='Vytvorené' && <button onClick={()=>handleRestoreBlogVersion(b.id,i)} className="text-[10px] px-2 py-0.5 rounded-full border">Obnoviť</button>}</div>)}</div>}</div><div className="flex gap-2 ml-3"><button onClick={()=>setReadingBlog(b)} className="text-xs px-3 py-1.5 rounded-xl border">Čítať</button><button onClick={()=>setEditingBlog(b)} className="text-xs px-3 py-1.5 rounded-xl border">Edit</button><button onClick={()=>{ if(!guard('delete_blog', b.authorId)) return; if(confirm('Zmazať blog?')){ setBlogs(prev=>prev.filter(x=>x.id!==b.id)); addActivity(`Zmazaný blog ${b.title}`);} }} className="text-xs px-3 py-1.5 rounded-xl border border-red-200 text-red-600">Zmazať</button></div></div></div>)}</div>
+
+              {readingBlog && <div className="fixed inset-0 z-50 bg-black/50 p-6 flex items-center justify-center overflow-auto"><div className="w-full max-w-2xl bg-white dark:bg-zinc-900 rounded-2xl p-6 border my-10"><div className="flex justify-between items-start mb-4"><div><h3 className="text-xl font-bold">{readingBlog.title}</h3><div className="text-xs mono text-zinc-500 mt-1">{readingBlog.date} • autor: {readingBlog.authorId} • stav: {readingBlog.status}</div></div><button onClick={()=>setReadingBlog(null)} className="px-3 py-1 rounded-lg border text-sm">Zavrieť</button></div><div className="prose prose-sm max-w-none border-t pt-4" dangerouslySetInnerHTML={{__html: sanitizeHtml(readingBlog.content)}}/></div></div>}
+
+              {editingBlog && <div className="fixed inset-0 z-50 bg-black/50 p-6 flex items-center justify-center overflow-auto"><div className="w-full max-w-2xl bg-white dark:bg-zinc-900 rounded-2xl p-5 border my-10"><input value={editingBlog.title} onChange={e=>setEditingBlog({...editingBlog, title:e.target.value})} placeholder="Názov" className="w-full px-3 py-2 rounded-xl border mb-2 bg-white dark:bg-zinc-800"/><input value={editingBlog.excerpt||''} onChange={e=>setEditingBlog({...editingBlog, excerpt:e.target.value})} placeholder="Excerpt" className="w-full px-3 py-2 rounded-xl border mb-2 bg-white dark:bg-zinc-800"/><div className="flex gap-1 mb-2">{[['b','B','font-bold'],['i','I','italic'],['h2','H2',''],['ul','• List',''],['link','Bezpečný Link','']].map(([k,l,cl])=><button key={k} onClick={()=>handleFormat(k)} className={`px-2 py-1 rounded-lg border text-xs ${cl}`}>{l}</button>)}</div><textarea id="blogContentTA" ref={blogContentRef} value={editingBlog.content} onChange={e=>setEditingBlog({...editingBlog, content:e.target.value})} className="w-full px-3 py-2 rounded-xl border h-36 mb-2 bg-white dark:bg-zinc-800 mono text-xs"></textarea><div className="text-xs text-zinc-500 mb-1">Živý sanitizovaný náhľad (DOMPurify):</div><div className="p-3 rounded-xl border bg-zinc-50 dark:bg-zinc-800 mb-3 prose prose-sm max-w-none" dangerouslySetInnerHTML={{__html: sanitizeHtml(editingBlog.content)}}/><div className="grid grid-cols-2 gap-2 mb-3"><select value={editingBlog.categoryId} onChange={e=>setEditingBlog({...editingBlog, categoryId:e.target.value})} className="px-3 py-2 rounded-xl border bg-white dark:bg-zinc-800">{visibleTopics.map(t=><option key={t.id} value={t.id}>{t.name}</option>)}</select><select value={editingBlog.status} onChange={e=>setEditingBlog({...editingBlog, status:e.target.value})} className="px-3 py-2 rounded-xl border bg-white dark:bg-zinc-800"><option value="koncept">koncept</option><option value="publikovaný">publikovaný</option><option value="archív">archív</option></select></div><div className="flex gap-2"><button onClick={handleUpdateBlog} className="px-4 py-2 rounded-xl bg-zinc-900 dark:bg-white text-white dark:text-zinc-900">Uložiť so snapshotom</button><button onClick={()=>setEditingBlog(null)} className="px-4 py-2 rounded-xl border">Zrušiť</button></div></div></div>}
+            </div>
+          )}
+
+          {section==='posts' && (
+            <div className="space-y-5">
+              <h2 className="text-2xl font-bold">Príspevky — CRUD + kompletná správa Checklistu</h2>
+              <div className="p-4 rounded-2xl bg-white dark:bg-zinc-900 border space-y-3">
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                  <input placeholder="Obsah príspevku" value={postDraft.content} onChange={e=>setPostDraft({...postDraft, content:e.target.value})} className="md:col-span-2 px-3 py-2 rounded-xl border bg-white dark:bg-zinc-800"/>
+                  <select value={postDraft.type} onChange={e=>setPostDraft({...postDraft, type:e.target.value})} className="px-3 py-2 rounded-xl border bg-white dark:bg-zinc-800"><option value="info">info</option><option value="task">task</option></select>
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                  <input placeholder="Položky checklistu (oddelené čiarkou, voliteľné)" value={postDraft.checklistText} onChange={e=>setPostDraft({...postDraft, checklistText:e.target.value})} className="md:col-span-2 px-3 py-2 rounded-xl border bg-white dark:bg-zinc-800 text-sm"/>
+                  <select value={effTopic()} onChange={e=>setPostDraft({...postDraft, topicId:e.target.value})} className="px-3 py-2 rounded-xl border bg-white dark:bg-zinc-800">{topics.filter(t=> showDemoData || !t.isDemo).map(t=><option key={t.id} value={t.id}>{t.name}</option>)}</select>
+                </div>
+                <button onClick={handleCreatePost} className="px-4 py-2 rounded-xl bg-zinc-900 dark:bg-white text-white dark:text-zinc-900 text-sm">+ Vytvoriť príspevok</button>
+              </div>
+              <div className="flex gap-2 items-center"><span className="text-xs text-zinc-500">Filter typu:</span>{['all','info','task'].map(t=><button key={t} onClick={()=>setPostTypeFilter(t)} className={`text-xs px-3 py-1.5 rounded-xl border ${postTypeFilter===t ? 'bg-zinc-900 text-white dark:bg-white dark:text-zinc-900' : ''}`}>{t}</button>)}</div>
+              <div className="space-y-3">{posts.filter(p=> (showDemoData || !p.isDemo) && (postTypeFilter==='all' || p.type===postTypeFilter)).map(p=>{
+                const topicObj = topics.find(t=>t.id===p.topicId);
+                return (
+                <div key={p.id} className={`p-4 rounded-2xl bg-white dark:bg-zinc-900 border ${p.pinned ? 'ring-2 ring-amber-300' : ''}`}>
+                  <div className="flex justify-between">
+                    <div className="flex-1">
+                      <div className="text-sm font-medium">{p.content} {p.isDemo && <span className="text-[9px] border px-1 rounded">DEMO</span>}</div>
+                      <div className="text-[11px] mono text-zinc-500 mt-1">{p.date} • {p.type} • {topicObj ? topicObj.name : p.topicId} • {p.authorId} {p.pinned && '• 📌'}</div>
+                      {p.checklist?.length>0 && <div className="mt-2 space-y-1">{p.checklist.map((c,i)=><label key={i} className="flex items-center gap-2 text-xs cursor-pointer"><input type="checkbox" checked={c.done} onChange={()=>handleToggleCheck(p.id,i)}/><span className={c.done ? 'line-through text-zinc-500' : ''}>{c.text}</span></label>)}</div>}
+                    </div>
+                    <div className="flex flex-col gap-1 ml-3">
+                      <button onClick={()=>handleTogglePin(p.id)} className="text-xs px-3 py-1.5 rounded-xl border">{p.pinned ? 'Odpinovať' : 'Pripnúť'}</button>
+                      <button onClick={()=>{setEditingPost({...p, checklist: [...(p.checklist||[])]}); setNewCheckItemText('');}} className="text-xs px-3 py-1.5 rounded-xl border">Edit</button>
+                      <button onClick={()=>handleDeletePost(p.id)} className="text-xs px-3 py-1.5 rounded-xl border border-red-200 text-red-600">Zmazať</button>
+                    </div>
+                  </div>
+                </div>
+              );})}</div>
+
+              {editingPost && (
+                <div className="fixed inset-0 z-50 bg-black/50 p-6 flex items-center justify-center overflow-auto">
+                  <div className="bg-white dark:bg-zinc-900 rounded-2xl p-5 border w-full max-w-lg space-y-3">
+                    <h3 className="font-semibold">Upraviť príspevok</h3>
+                    <textarea value={editingPost.content} onChange={e=>setEditingPost({...editingPost, content:e.target.value})} className="w-full px-3 py-2 rounded-xl border h-24 bg-white dark:bg-zinc-800"></textarea>
+                    <div className="grid grid-cols-2 gap-2">
+                      <select value={editingPost.type} onChange={e=>setEditingPost({...editingPost, type:e.target.value})} className="px-3 py-2 rounded-xl border bg-white dark:bg-zinc-800"><option value="info">info</option><option value="task">task</option></select>
+                      <select value={editingPost.topicId} onChange={e=>setEditingPost({...editingPost, topicId:e.target.value})} className="px-3 py-2 rounded-xl border bg-white dark:bg-zinc-800">{visibleTopics.map(t=><option key={t.id} value={t.id}>{t.name}</option>)}</select>
+                    </div>
+                    <div className="border-t pt-3">
+                      <div className="text-xs font-medium mb-2">Checklist úloh:</div>
+                      <div className="space-y-1.5 max-h-40 overflow-auto mb-2">
+                        {(editingPost.checklist||[]).map((item, idx)=>(
+                          <div key={idx} className="flex items-center gap-2">
+                            <input type="checkbox" checked={item.done} onChange={()=>setEditingPost({...editingPost, checklist: editingPost.checklist.map((c,i)=>i===idx?{...c,done:!c.done}:c)})}/>
+                            <input value={item.text} onChange={e=>setEditingPost({...editingPost, checklist: editingPost.checklist.map((c,i)=>i===idx?{...c,text:e.target.value}:c)})} className="flex-1 px-2 py-1 text-xs rounded border bg-white dark:bg-zinc-800"/>
+                            <button onClick={()=>setEditingPost({...editingPost, checklist: editingPost.checklist.filter((_,i)=>i!==idx)})} className="text-xs px-2 py-0.5 rounded border border-red-200 text-red-600">✕</button>
+                          </div>
+                        ))}
+                      </div>
+                      <div className="flex gap-2">
+                        <input value={newCheckItemText} onChange={e=>setNewCheckItemText(e.target.value)} placeholder="Nová položka checklistu..." className="flex-1 px-2.5 py-1.5 text-xs rounded-lg border bg-white dark:bg-zinc-800"/>
+                        <button onClick={()=>{ if(!newCheckItemText.trim()) return; setEditingPost({...editingPost, checklist:[...(editingPost.checklist||[]), {text:newCheckItemText.trim(), done:false}]}); setNewCheckItemText(''); }} className="text-xs px-3 py-1.5 rounded-lg border">+ Pridať</button>
+                      </div>
+                    </div>
+                    <div className="flex gap-2 pt-2">
+                      <button onClick={handleUpdatePost} className="px-4 py-2 rounded-xl bg-zinc-900 dark:bg-white text-white dark:text-zinc-900">Uložiť</button>
+                      <button onClick={()=>setEditingPost(null)} className="px-4 py-2 rounded-xl border">Zrušiť</button>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {section==='chat' && (
+            <div className="space-y-5">
+              <h2 className="text-2xl font-bold">Chat — synchronizovaný medzi tabmi prehliadača (max {MAX_CHAT_MESSAGES} správ)</h2>
+              <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={showDemoData} onChange={e=>setShowDemoData(e.target.checked)}/> Zobraziť demo správy</label>
+              <div className="p-4 rounded-2xl bg-white dark:bg-zinc-900 border h-[400px] flex flex-col"><div className="flex-1 overflow-auto space-y-2">{chat.filter(c=> showDemoData || !c.isDemo).map(m=>{ const u=USERS.find(x=>x.id===m.userId); return <div key={m.id} className="flex gap-2"><div className="w-7 h-7 rounded-full flex items-center justify-center text-white text-xs font-bold" style={{background:u?.color}}>{u?.initials}</div><div><div className="text-xs"><span className="font-medium">{u?.name}</span> <span className="mono text-zinc-500">{timeAgo(m.time)}</span> {m.isDemo && <span className="text-[9px] border px-1 rounded">DEMO</span>}</div><div className="text-sm">{m.text}</div></div></div>; })}</div><div className="mt-3 flex gap-2"><input value={chatInput} onChange={e=>setChatInput(e.target.value)} onKeyDown={e=>{ if(e.key==='Enter') handleSendChat(); }} placeholder="Správa..." className="flex-1 px-3 py-2 rounded-xl border bg-zinc-50 dark:bg-zinc-800"/><button onClick={handleSendChat} className="px-4 py-2 rounded-xl bg-zinc-900 dark:bg-white text-white dark:text-zinc-900 text-sm">Poslať</button></div></div>
+            </div>
+          )}
+
+          {section==='search' && (
+            <div className="space-y-5">
+              <h2 className="text-2xl font-bold">Vyhľadávanie — lokálne dátumy + fulltext (TXT/CSV/HTML/DOCX/XLSX)</h2>
+              <div className="p-5 rounded-2xl bg-white dark:bg-zinc-900 border space-y-4">
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-3"><div className="md:col-span-2"><label className="text-xs font-medium">Fulltext (názov + tagy + extrahovaný obsah dokumentov, blogov a úloh)</label><input id="search-input" value={searchQ} onChange={e=>setSearchQ(e.target.value)} placeholder="Hľadaj..." className="w-full mt-1 px-3 py-2 rounded-xl border bg-zinc-50 dark:bg-zinc-800"/></div><div><label className="text-xs font-medium">Typ</label><select value={searchContentType} onChange={e=>setSearchContentType(e.target.value)} className="w-full mt-1 px-3 py-2 rounded-xl border bg-zinc-50 dark:bg-zinc-800"><option value="all">Všetko</option><option value="doc">Dokumenty</option><option value="blog">Blogy</option><option value="post">Príspevky</option></select></div></div>
+                <div className="grid grid-cols-1 md:grid-cols-5 gap-3"><div><label className="text-xs font-medium">Dátum</label><select value={searchDate} onChange={e=>setSearchDate(e.target.value)} className="w-full mt-1 px-3 py-2 rounded-xl border bg-zinc-50 dark:bg-zinc-800"><option value="all">Kedykoľvek</option><option value="today">Dnes (lokálne)</option><option value="week">Tento týždeň Po-Ne</option><option value="month">Tento mesiac</option><option value="custom">Vlastný</option></select></div>{searchDate==='custom' && <><div><label className="text-xs font-medium">Od</label><input type="date" value={searchDateFrom} onChange={e=>setSearchDateFrom(e.target.value)} className="w-full mt-1 px-3 py-2 rounded-xl border bg-white dark:bg-zinc-800"/></div><div><label className="text-xs font-medium">Do</label><input type="date" value={searchDateTo} onChange={e=>setSearchDateTo(e.target.value)} className="w-full mt-1 px-3 py-2 rounded-xl border bg-white dark:bg-zinc-800"/></div></>}<div><label className="text-xs font-medium">Stav blogu</label><select value={searchStatus} onChange={e=>setSearchStatus(e.target.value)} className="w-full mt-1 px-3 py-2 rounded-xl border bg-zinc-50 dark:bg-zinc-800"><option value="all">Všetky</option><option value="publikovaný">publikovaný</option><option value="koncept">koncept</option><option value="archív">archív</option></select></div><div><label className="text-xs font-medium">Autor</label><select value={authorFilter} onChange={e=>setAuthorFilter(e.target.value)} className="w-full mt-1 px-3 py-2 rounded-xl border bg-zinc-50 dark:bg-zinc-800"><option value="all">Všetci</option><option value="me">Moje</option></select></div></div>
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-3"><div><label className="text-xs font-medium">Tagy (case-insensitive)</label><input placeholder="brand, report" value={searchTags.join(',')} onChange={e=>setSearchTags(e.target.value.split(',').map(s=>s.trim()).filter(Boolean))} className="w-full mt-1 px-3 py-2 rounded-xl border bg-zinc-50 dark:bg-zinc-800"/></div><div className="flex items-end gap-2"><label className="flex items-center gap-2 text-xs"><input type="checkbox" checked={pinnedOnly} onChange={e=>setPinnedOnly(e.target.checked)}/> Len pripnuté</label></div><div className="flex items-end"><button onClick={resetAllFilters} className="w-full px-3 py-2 rounded-xl bg-zinc-900 dark:bg-white text-white dark:text-zinc-900 text-sm">Reset všetkých filtrov</button></div></div>
+              </div>
+              <div className="grid grid-cols-1 lg:grid-cols-3 gap-4"><div className="space-y-2"><h3 className="font-semibold text-sm">Dokumenty ({filteredDocs.length})</h3>{filteredDocs.map(d=><div key={d.id} onClick={()=>setShowPreview(d)} className="p-3 rounded-xl bg-white dark:bg-zinc-900 border text-sm cursor-pointer hover:border-zinc-400"><div className="font-medium">{d.name}</div><div className="text-[11px] text-zinc-500">{d.date} • {(d.tags||[]).join(', ')} • {d.authorId}</div></div>)}</div><div className="space-y-2"><h3 className="font-semibold text-sm">Blogy ({filteredBlogs.length})</h3>{filteredBlogs.map(b=><div key={b.id} onClick={()=>setReadingBlog(b)} className="p-3 rounded-xl bg-white dark:bg-zinc-900 border text-sm cursor-pointer hover:border-zinc-400"><div className="font-medium">{b.title}</div><div className="text-[11px] text-zinc-500">{b.date} • {b.status} • {b.authorId}</div></div>)}</div><div className="space-y-2"><h3 className="font-semibold text-sm">Príspevky ({filteredPosts.length})</h3>{filteredPosts.map(p=><div key={p.id} className="p-3 rounded-xl bg-white dark:bg-zinc-900 border text-sm"><div>{p.content}</div><div className="text-[11px] text-zinc-500">{p.date} • {p.type}</div></div>)}</div></div>
+            </div>
+          )}
+
+          {section==='audit' && (
+            <div className="space-y-5">
+              <h2 className="text-2xl font-bold">Audit v6 — reálne testy (PASS/ARCHITEKTÚRA/NEOVERENÉ)</h2>
+              <div className="p-5 rounded-2xl bg-white dark:bg-zinc-900 border">
+                <div className="space-y-2">
+                  {auditTests.map((t,i)=>(
+                    <div key={i} className={`flex gap-3 text-sm p-2.5 rounded-xl border ${t.status==='PASS' ? 'bg-emerald-50 dark:bg-emerald-950/30 border-emerald-200 dark:border-emerald-800' : t.status==='ARCHITEKTÚRA' ? 'bg-amber-50 dark:bg-amber-950/30 border-amber-200 dark:border-amber-800' : 'bg-red-50 border-red-200'}`}>
+                      <span>{t.status==='PASS' ? '✅' : t.status==='ARCHITEKTÚRA' ? '⚠️' : '❌'}</span><div className="flex-1"><div className="font-medium">{i+1}. {t.name} — {t.status}</div><div className="text-xs text-zinc-600 dark:text-zinc-400">{t.detail}</div></div>
+                    </div>
+                  ))}
+                </div>
+                <button onClick={()=>runRealTests().then(setAuditTests)} className="mt-4 px-4 py-2 rounded-xl border text-sm">Spustiť testy znova</button>
+              </div>
+            </div>
+          )}
+
+          {section==='settings' && (
+            <div className="space-y-5">
+              <h2 className="text-2xl font-bold">Nastavenia v6</h2>
+              <div className="p-5 rounded-2xl bg-white dark:bg-zinc-900 border space-y-4">
+                <div><div className="font-medium text-sm">Zmena hesla (PBKDF2 + soľ, vyžaduje staré heslo)</div><div className="flex gap-2 mt-2"><input type="password" placeholder="Staré heslo" value={oldPw} onChange={e=>setOldPw(e.target.value)} className="flex-1 px-3 py-2 rounded-xl border bg-white dark:bg-zinc-800"/><input type="password" placeholder="Nové min. 8 znakov" value={newPw} onChange={e=>setNewPw(e.target.value)} className="flex-1 px-3 py-2 rounded-xl border bg-white dark:bg-zinc-800"/><button onClick={handleChangePassword} className="px-4 py-2 rounded-xl bg-zinc-900 dark:bg-white text-white dark:text-zinc-900">Zmeniť</button></div></div>
+                <div className="border-t pt-4"><div className="font-medium text-sm">Úložisko dokumentov</div><div className="text-xs text-zinc-500">Dokumenty označené HOSTING sú uložené v privátnom priečinku na serveri cez PHP API. Staršie lokálne záznamy zostávajú v IndexedDB/localStorage. Na tímové zdieľanie pripoj hosting v sekcii Dokumenty.</div>{docsError && <div className="mt-2 text-xs text-red-600">{docsError}</div>}<button onClick={async()=>{ if(confirm('Vymazať všetky dáta v localStorage aj IndexedDB?')){ try{ await idbClear(); }catch(e){} try{
+        await idbClear();
+      }catch(e){
+        showToast('IndexedDB sa nepodarilo vymazať: '+(e?.message||e),'error');
+        return;
+      }
+      Object.keys(localStorage).filter(k=>k.startsWith('admin_hub_')).forEach(k=>localStorage.removeItem(k)); location.reload(); } }} className="mt-2 text-xs px-3 py-1.5 rounded-xl border border-red-200 text-red-600">Vymazať localStorage + IndexedDB</button></div>
+              </div>
+            </div>
+          )}
+
+        </div>
+      </div>
+
+      {/* Globálny preview modal */}
+      {showPreview && (
+        <div className="fixed inset-0 z-50 bg-black/50 p-6 flex items-center justify-center">
+          <div className="w-full max-w-3xl bg-white dark:bg-zinc-900 rounded-2xl border p-4 max-h-[90vh] overflow-auto">
+            <div className="flex flex-wrap justify-between gap-3 mb-3"><div><div className="font-semibold break-words">{showPreview.name} <span className="text-[10px] mono text-zinc-500">{showPreview.type} • {showPreview.size}</span></div><div className="text-[11px] text-zinc-500 mt-1">Aktuálnu verziu nahral: {documentUserName(showPreview.authorId)} · {documentDateLabel(showPreview)}</div></div><div className="flex gap-2 shrink-0"><button onClick={()=>handleDownload(showPreview)} className="px-3 py-1 rounded-lg border">Stiahnuť</button><button onClick={()=>{setShowPreview(null); history.replaceState(null,'',window.location.pathname);}} className="px-3 py-1 rounded-lg border">Zavrieť</button></div></div>
+            <div>
+              {(()=>{
+                const content=previewData.resolvedContent;
+                if(!content) return <div className="text-sm text-zinc-500">DEMO dokument bez binárneho obsahu (textový index: {showPreview.extractedText || 'žiadny'})</div>;
+                if(previewData.error && ['csv','xlsx','docx'].includes(showPreview.type)) return <div className="p-3 bg-red-50 border border-red-200 rounded-xl text-sm text-red-800">{previewData.error}</div>;
+                if(showPreview.type==='image') return <img src={content} className="max-w-full rounded-xl"/>;
+                if(showPreview.type==='video') return <video src={content} controls className="w-full rounded-xl"/>;
+                if(showPreview.type==='pdf') return <iframe src={content} className="w-full h-[60vh] rounded-xl border" title="pdf"/>;
+                if(showPreview.type==='html'){
+                  return <div><div className="text-[11px] text-amber-700 bg-amber-50 border border-amber-200 p-2 rounded-xl mb-2">⚠️ HTML náhľad: sandbox="" (blokuje skripty) + DOMPurify sanitizácia (odstraňuje on* atributy). Pre maximálnu bezpečnosť.</div><iframe sandbox={HTML_PREVIEW_SANDBOX} srcDoc={sanitizeHtml(previewData.html)} className="w-full h-[60vh] rounded-xl border bg-white" title="html preview"/></div>;
+                }
+                if(showPreview.type==='csv'){
+                  return <div className="overflow-auto"><div className="text-[11px] mono mb-2">Delimiter: {previewData.delimiter || ','}</div><table className="text-xs border-collapse">{previewData.csvRows.map((row,i)=><tr key={i}>{row.map((cell,j)=><td key={j} className="border px-2 py-1">{cell}</td>)}</tr>)}</table></div>;
+                }
+                if(showPreview.type==='xlsx'){
+                  return <div className="overflow-auto"><div className="text-[11px] mono mb-2">XLSX via SheetJS (prvých 50 riadkov)</div><table className="text-xs border-collapse">{previewData.xlsxRows.map((row,i)=><tr key={i}>{row.map((cell,j)=><td key={j} className="border px-2 py-1">{String(cell??'')}</td>)}</tr>)}</table></div>;
+                }
+                if(showPreview.type==='docx'){
+                  return <div><div className="text-[11px] mono mb-2">DOCX via Mammoth.js + DOMPurify</div><div className="prose prose-sm max-w-none p-3 bg-white dark:bg-zinc-800 rounded-xl border" dangerouslySetInnerHTML={{__html: previewData.docxHtml || '<p>Načítavam...</p>'}}></div></div>;
+                }
+                if(showPreview.type==='txt'){
+                  const txt=base64ToUtf8(dataURLtoBase64(content));
+                  return <pre className="text-xs p-3 bg-zinc-50 dark:bg-zinc-800 rounded-xl whitespace-pre-wrap">{txt}</pre>;
+                }
+                return <div className="text-sm">Typ {showPreview.type} — použite Stiahnuť. Verzie: {showPreview.versions?.length||0}</div>;
+              })()}
+            </div>
+          </div>
+        </div>
+      )}
+
+    </div>
+  );
+}
+
+const root=ReactDOM.createRoot(document.getElementById('root'));
+root.render(<App/>);
+</script>
+</body>
+</html>
